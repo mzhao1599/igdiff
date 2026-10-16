@@ -613,7 +613,14 @@ describe('progress', () => {
 describe('classifyFailure', () => {
   it('maps statuses and Instagram messages to a retry policy', () => {
     const none = null;
-    const info = (patch: object) => ({ message: null, requireLogin: false, challenge: false, spam: false, ...patch });
+    const info = (patch: object) => ({
+      message: null,
+      requireLogin: false,
+      challenge: false,
+      spam: false,
+      actionBlocked: false,
+      ...patch,
+    });
     expect(classifyFailure(429, none)).toBe('throttled');
     expect(classifyFailure(0, none)).toBe('throttled');
     expect(classifyFailure(400, info({ message: 'Please wait a few minutes' }))).toBe('throttled');

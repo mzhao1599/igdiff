@@ -1,0 +1,60 @@
+name: Extension
+
+on:
+  push:
+    paths:
+      - 'extension/**'
+      - '.github/workflows/extension.yml'
+  pull_request:
+    paths:
+      - 'extension/**'
+      - '.github/workflows/extension.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: extension-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: extension
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: extension/package-lock.json
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+
+      # Production build (no diagnostics page, no dev bridge) and a dev build.
+      - run: npm run build
+      - run: npm run build:dev
+
+      # The production bundle must never contain the dev bridge.
+      - name: Production build has no dev-only code
+        run: |
+          if grep -rl "follower-tracker-dev" .output/chrome-mv3; then
+            echo "Dev bridge found in the production build" >&2
+            exit 1
+          fi
+          test ! -e .output/chrome-mv3/diagnostics.html
+
+      - run: npm run zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: follower-tracker-chrome
+          path: extension/.output/*-chrome.zip
+          if-no-files-found: error

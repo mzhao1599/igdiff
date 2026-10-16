@@ -15,6 +15,9 @@ import {
   type SchedulerStatus,
   type SyncStartResponse,
   type SyncStopResponse,
+  type UnfollowStartError,
+  type UnfollowStartResponse,
+  type UnfollowStatus,
 } from '../lib/messages';
 import {
   budgetUsedToday,
@@ -28,6 +31,10 @@ import {
   type Lease,
 } from '../lib/scheduler/policy';
 import { schedulerState } from '../lib/scheduler/state';
+import { recordBlock, recordUnfollows, unfollowAllowance, unfollowsToday } from '../lib/actions/limits';
+import { unfollowState, type UnfollowJob } from '../lib/actions/state';
+import type { UnfollowItemResult, UnfollowRunResult } from '../lib/actions/unfollow';
+import { unfollowerBadge } from '../lib/notify/badge';
 import { computeRelationships } from '../lib/tracker/diff';
 import { TrackerStore, type CommitOutcome } from '../lib/tracker/store';
 
@@ -302,6 +309,9 @@ export default defineBackground(() => {
 
       // Results from a run whose lease was already declared dead are still saved when complete.
       const outcome = await db.commit(result);
+      if (outcome.status === 'committed' && outcome.diffCounts) {
+        await unfollowerBadge.add(outcome.viewerId, outcome.diffCounts.followersLost);
+      }
 
       if (ours && viewerId) {
         const checkpoint = await db.getCheckpoint(viewerId);
@@ -322,6 +332,185 @@ export default defineBackground(() => {
       syncWaiters.splice(0).forEach(resolve => resolve({ result: summarizeResult(result), outcome }));
       return outcome;
     });
+  }
+
+  // --- Unfollowing ---------------------------------------------------------------
+  // Only ever started by the user from the side panel. Runs in an Instagram tab;
+  // the job (queue and counts) lives in storage so a closed tab or a restarted
+  // worker leaves it paused, never lost and never resumed without the user.
+
+  async function launchUnfollows(job: UnfollowJob, maxUnfollows: number): Promise<UnfollowStartResponse> {
+    if (job.tabId === null) {
+      return { ok: false, error: 'no_instagram_tab' };
+    }
+    const running: UnfollowJob = { ...job, status: 'running', outcome: null, message: null, updatedAt: Date.now() };
+    await unfollowState.setJob(running);
+    const ack = await sendToTab<{ started: boolean }>(job.tabId, {
+      type: 'unfollow:run',
+      jobId: job.id,
+      pks: job.queue,
+      maxUnfollows,
+    }).catch(() => ({ started: false }));
+    if (!ack.started) {
+      await unfollowState.setJob({ ...running, status: 'paused', outcome: 'interrupted', message: 'Could not start in the Instagram tab.' });
+      broadcast({ type: 'unfollow:changed' });
+      return { ok: false, error: 'already_running' };
+    }
+    broadcast({ type: 'unfollow:changed' });
+    return { ok: true, job: running };
+  }
+
+  type Preflight =
+    | { readonly ok: true; readonly tabId: number; readonly remaining: number }
+    | { readonly ok: false; readonly error: UnfollowStartError; readonly until?: number };
+
+  /** Common checks before unfollowing anything: right account, nothing running, allowed today. */
+  async function unfollowPreflight(viewerId: string): Promise<Preflight> {
+    const env = await readEnv();
+    if (env.problem || env.tabId === null || !env.collector?.viewerId) {
+      return { ok: false, error: env.problem ?? 'signed_out' };
+    }
+    if (env.collector.viewerId !== viewerId) {
+      return { ok: false, error: 'wrong_account' };
+    }
+    const state = await unfollowState.read();
+    if (state.job?.status === 'running') {
+      return { ok: false, error: 'already_running' };
+    }
+    const allowance = unfollowAllowance(state.ledgers[viewerId], Date.now());
+    if (!allowance.allowed) {
+      return { ok: false, error: allowance.reason, until: allowance.until };
+    }
+    return { ok: true, tabId: env.tabId, remaining: allowance.remaining };
+  }
+
+  function startUnfollows(viewerId: string, pks: readonly string[]): Promise<UnfollowStartResponse> {
+    return exclusive(async () => {
+      const check = await unfollowPreflight(viewerId);
+      if (!check.ok) {
+        return check;
+      }
+      // Kept accounts are never unfollowed, whatever the page sent.
+      const kept = await (await store).listKeep(viewerId);
+      const queue = Array.from(new Set(pks)).filter(pk => !kept.has(pk));
+      if (queue.length === 0) {
+        return { ok: false, error: 'nothing_to_do' };
+      }
+      const now = Date.now();
+      return launchUnfollows(
+        {
+          id: crypto.randomUUID(),
+          viewerId,
+          tabId: check.tabId,
+          queue,
+          total: queue.length,
+          unfollowed: 0,
+          skipped: 0,
+          status: 'running',
+          startedAt: now,
+          updatedAt: now,
+          outcome: null,
+          message: null,
+        },
+        check.remaining,
+      );
+    });
+  }
+
+  function resumeUnfollows(): Promise<UnfollowStartResponse> {
+    return exclusive(async () => {
+      const job = (await unfollowState.read()).job;
+      if (!job || job.status !== 'paused' || job.queue.length === 0) {
+        return { ok: false, error: 'nothing_to_do' };
+      }
+      const check = await unfollowPreflight(job.viewerId);
+      if (!check.ok) {
+        return check;
+      }
+      const kept = await (await store).listKeep(job.viewerId);
+      return launchUnfollows({ ...job, tabId: check.tabId, queue: job.queue.filter(pk => !kept.has(pk)) }, check.remaining);
+    });
+  }
+
+  function onUnfollowItem(jobId: string, item: UnfollowItemResult) {
+    return exclusive(async () => {
+      const state = await unfollowState.read();
+      const job = state.job;
+      if (!job || job.id !== jobId) {
+        return;
+      }
+      await (await store).recordAction({
+        viewerId: job.viewerId,
+        pk: item.pk,
+        type: 'unfollow',
+        outcome: item.outcome,
+        detail: item.detail,
+        at: item.at,
+      });
+      if (item.outcome === 'unfollowed') {
+        await unfollowState.setLedger(job.viewerId, recordUnfollows(state.ledgers[job.viewerId], 1, item.at));
+      }
+      await unfollowState.setJob({
+        ...job,
+        queue: job.queue.filter(pk => pk !== item.pk),
+        unfollowed: job.unfollowed + (item.outcome === 'unfollowed' ? 1 : 0),
+        skipped: job.skipped + (item.outcome === 'unfollowed' ? 0 : 1),
+        updatedAt: item.at,
+      });
+      broadcast({ type: 'unfollow:changed' });
+    });
+  }
+
+  function onUnfollowFinished(jobId: string, result: UnfollowRunResult) {
+    return exclusive(async () => {
+      const state = await unfollowState.read();
+      const job = state.job;
+      if (!job || job.id !== jobId) {
+        return;
+      }
+      const now = Date.now();
+      if (result.outcome === 'blocked') {
+        await unfollowState.setLedger(job.viewerId, recordBlock(state.ledgers[job.viewerId], now));
+      }
+      const finished = result.outcome === 'completed' || result.remaining.length === 0;
+      await unfollowState.setJob({
+        ...job,
+        queue: result.remaining,
+        status: finished ? 'finished' : 'paused',
+        outcome: result.outcome,
+        message: result.message,
+        endpoint: result.endpoint ?? job.endpoint ?? null,
+        updatedAt: now,
+      });
+      broadcast({ type: 'unfollow:changed' });
+    });
+  }
+
+  /** The job's tab closed or reloaded mid-run: keep what's left, paused. */
+  function pauseInterruptedUnfollows(tabId: number) {
+    return exclusive(async () => {
+      const job = (await unfollowState.read()).job;
+      if (job?.status === 'running' && job.tabId === tabId) {
+        await unfollowState.setJob({
+          ...job,
+          status: 'paused',
+          outcome: 'interrupted',
+          message: 'The Instagram tab was closed or reloaded. Resume to continue.',
+          updatedAt: Date.now(),
+        });
+        broadcast({ type: 'unfollow:changed' });
+      }
+    });
+  }
+
+  async function unfollowStatus(viewerId: string | null): Promise<UnfollowStatus> {
+    const state = await unfollowState.read();
+    const now = Date.now();
+    return {
+      job: state.job,
+      allowance: viewerId ? unfollowAllowance(state.ledgers[viewerId], now) : null,
+      today: viewerId ? unfollowsToday(state.ledgers[viewerId], now) : 0,
+    };
   }
 
   // --- Status --------------------------------------------------------------------
@@ -411,8 +600,43 @@ export default defineBackground(() => {
         if (!fromInstagramTab(sender)) {
           return undefined;
         }
-        // A tab that just (re)loaded is not running anything, whatever the lease says.
+        // A tab that just (re)loaded is not running anything, whatever the lease or job says.
+        void pauseInterruptedUnfollows(sender.tab.id);
         return tryAutoSync({ preferTabId: sender.tab.id, reloadedTabId: sender.tab.id });
+      case 'unfollow:start':
+        return startUnfollows(message.viewerId, message.pks);
+      case 'unfollow:resume':
+        return resumeUnfollows();
+      case 'unfollow:stop':
+        return (async () => {
+          const job = (await unfollowState.read()).job;
+          const tabs = job?.tabId !== null && job?.tabId !== undefined ? [job.tabId] : (await instagramTabs()).map(tab => tab.id);
+          await Promise.all(tabs.map(tabId => sendToTab(tabId, { type: 'unfollow:stop' }).catch(() => undefined)));
+          return { ok: true };
+        })();
+      case 'unfollow:discard':
+        return exclusive(async () => {
+          const job = (await unfollowState.read()).job;
+          if (job?.status !== 'running') {
+            await unfollowState.setJob(null);
+            broadcast({ type: 'unfollow:changed' });
+          }
+          return { ok: true };
+        });
+      case 'unfollow:status':
+        return unfollowStatus(message.viewerId);
+      case 'badge:clear':
+        return unfollowerBadge.clear(message.viewerId).then(() => ({ ok: true }));
+      case 'unfollow:item':
+        if (fromInstagramTab(sender)) {
+          void onUnfollowItem(message.jobId, message.item);
+        }
+        return undefined;
+      case 'unfollow:finished':
+        if (fromInstagramTab(sender)) {
+          void onUnfollowFinished(message.jobId, message.result);
+        }
+        return undefined;
       case 'collector:progress':
         if (fromInstagramTab(sender)) {
           void onHeartbeat(sender.tab.id);
@@ -466,6 +690,7 @@ export default defineBackground(() => {
 
   // The syncing tab was closed: release the lease and resume in another tab if there is one.
   browser.tabs.onRemoved.addListener(tabId => {
+    void pauseInterruptedUnfollows(tabId);
     void (async () => {
       const lease = await schedulerState.getLease();
       if (lease?.tabId === tabId) {
@@ -499,7 +724,8 @@ export default defineBackground(() => {
     const relationships = latest ? computeRelationships(latest) : null;
     const snapshots = await db.listSnapshots(account.viewerId, 10);
     const events = await db.listEvents(account.viewerId, 50);
-    const profiles = await db.getProfiles(account.viewerId, events.map(event => event.pk));
+    const actions = await db.listActions(account.viewerId, -Infinity, 20);
+    const profiles = await db.getProfiles(account.viewerId, [...events.map(event => event.pk), ...actions.map(action => action.pk)]);
     return {
       account,
       latest: latest && {
@@ -526,14 +752,28 @@ export default defineBackground(() => {
         username: profiles.get(event.pk)?.username ?? event.pk,
         verification: event.verification ?? null,
       })),
+      actions: actions.map(action => ({
+        at: new Date(action.at).toISOString(),
+        username: profiles.get(action.pk)?.username ?? action.pk,
+        outcome: action.outcome,
+        detail: action.detail,
+      })),
     };
   }
 
-  if (DIAGNOSTICS_ENABLED) {
-    // Firefox builds default to MV2, where the toolbar button is `browserAction`.
-    const action = browser.action ?? browser.browserAction;
-    action.onClicked.addListener(() => {
-      void browser.tabs.create({ url: browser.runtime.getURL('/diagnostics.html') });
-    });
+  // Badges reset when the extension reloads; put the unseen count back.
+  void unfollowerBadge.restore().catch(() => undefined);
+
+  // The toolbar button opens the side panel (Chrome) or the sidebar (Firefox).
+  if (browser.sidePanel) {
+    void browser.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => undefined);
+  } else {
+    // Firefox-only API, missing from WXT's Chrome-based types.
+    const sidebar = (browser as unknown as { sidebarAction?: { open(): Promise<void> } }).sidebarAction;
+    if (sidebar) {
+      (browser.action ?? browser.browserAction).onClicked.addListener(() => {
+        void sidebar.open();
+      });
+    }
   }
 });

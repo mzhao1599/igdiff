@@ -6,6 +6,8 @@
  *   GET  /api/v1/friendships/{id}/followers/?count=N   followers list page
  *   POST /api/v1/friendships/show_many/                bulk friendship status
  *
+ *   POST /api/v1/friendships/destroy/{id}/             unfollow (falls back to /web/friendships/{id}/unfollow/)
+ *
  * These are unofficial and change without notice, so every call returns its raw
  * status and a failure hint instead of throwing, and callers decide what a
  * failure means. Nothing here retries, sleeps, or stores anything.
@@ -30,6 +32,11 @@ export const STATUS_NETWORK_ERROR = -1;
 export interface InstagramClient {
   readonly fetch: typeof fetch;
   readonly csrfToken: () => string | null;
+  /**
+   * Extra headers Instagram's own web client sends (claim, AJAX revision, ASBD id).
+   * Only added to write requests; reads are proven to work without them.
+   */
+  readonly webClientHeaders?: () => Record<string, string>;
 }
 
 export interface IgUser {
@@ -50,6 +57,8 @@ export interface FailureInfo {
   readonly requireLogin: boolean;
   readonly challenge: boolean;
   readonly spam: boolean;
+  /** Instagram's "Try Again Later" / feedback_required answer to an action it won't allow right now. */
+  readonly actionBlocked: boolean;
 }
 
 /** What came back, for diagnostics. Never contains the body itself. */
@@ -162,6 +171,8 @@ interface RawFailureBody {
   checkpoint_url?: unknown;
   challenge?: unknown;
   spam?: unknown;
+  feedback_title?: unknown;
+  feedback_required?: unknown;
 }
 
 export function clampPageSize(value: number | undefined): number {
@@ -283,6 +294,8 @@ export function parseFailureBody(body: unknown, finalUrl: string): FailureInfo {
       (record.challenge !== undefined && record.challenge !== null) ||
       finalUrl.includes('/challenge'),
     spam: record.spam === true,
+    actionBlocked:
+      message === 'feedback_required' || record.feedback_required === true || typeof record.feedback_title === 'string',
   };
 }
 
@@ -490,4 +503,47 @@ export async function fetchFriendshipStatus(
       followedBy: typeof source.followed_by === 'boolean' ? source.followed_by : null,
     },
   };
+}
+
+/** Which unfollow endpoint answered. `destroy` is what the web app uses today; `web` is the older one. */
+export type UnfollowEndpoint = 'destroy' | 'web';
+
+export interface UnfollowAnswer {
+  readonly endpoint: UnfollowEndpoint;
+  /** `friendship_status.following` after the call when Instagram sent it; must not be true. */
+  readonly following: boolean | null;
+}
+
+interface RawUnfollowResponse {
+  status?: string;
+  friendship_status?: RawFriendship;
+}
+
+/**
+ * Unfollows one account. Changes the user's account: only call this for an
+ * account the user chose to unfollow.
+ */
+export async function unfollowUser(
+  client: InstagramClient,
+  userId: string,
+  endpoint: UnfollowEndpoint,
+): Promise<ApiResult<UnfollowAnswer>> {
+  const id = encodeURIComponent(userId);
+  const url =
+    endpoint === 'destroy'
+      ? `${INSTAGRAM_ORIGIN}/api/v1/friendships/destroy/${id}/`
+      : `${INSTAGRAM_ORIGIN}/web/friendships/${id}/unfollow/`;
+  const result = await requestJson<RawUnfollowResponse>(client, url, {
+    method: 'POST',
+    headers: buildHeaders(client, {
+      ...client.webClientHeaders?.(),
+      'content-type': 'application/x-www-form-urlencoded',
+    }),
+    body: endpoint === 'destroy' ? `user_id=${id}&container_module=profile` : '',
+  });
+  if (result.data === null) {
+    return { ...result, data: null };
+  }
+  const following = result.data.friendship_status?.following;
+  return { ...result, data: { endpoint, following: typeof following === 'boolean' ? following : null } };
 }

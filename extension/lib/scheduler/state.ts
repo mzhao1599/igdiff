@@ -32,6 +32,13 @@ interface LocalState {
 const LOCAL_KEY = 'scheduler';
 const LEASE_KEY = 'scheduler.lease';
 
+/**
+ * The lease belongs in session storage (gone after a browser restart, when nothing
+ * runs anyway). Firefox's MV2 builds may lack it; local storage is fine there because
+ * a lease without heartbeats expires after a minute.
+ */
+const leaseArea = () => browser.storage.session ?? browser.storage.local;
+
 async function readLocal(): Promise<LocalState> {
   const stored = (await browser.storage.local.get(LOCAL_KEY))[LOCAL_KEY] as Partial<LocalState> | undefined;
   return {
@@ -75,14 +82,14 @@ export const schedulerState = {
     }),
 
   async getLease(): Promise<Lease | null> {
-    return ((await browser.storage.session.get(LEASE_KEY))[LEASE_KEY] as Lease | undefined) ?? null;
+    return ((await leaseArea().get(LEASE_KEY))[LEASE_KEY] as Lease | undefined) ?? null;
   },
 
   async setLease(lease: Lease | null): Promise<void> {
     if (lease) {
-      await browser.storage.session.set({ [LEASE_KEY]: lease });
+      await leaseArea().set({ [LEASE_KEY]: lease });
     } else {
-      await browser.storage.session.remove(LEASE_KEY);
+      await leaseArea().remove(LEASE_KEY);
     }
   },
 };

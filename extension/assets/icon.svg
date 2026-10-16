@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3b82f6"/>
+      <stop offset="1" stop-color="#4338ca"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="url(#bg)"/>
+  <!-- The person behind: someone you follow. -->
+  <circle cx="82" cy="44" r="15" fill="#ffffff" fill-opacity="0.5"/>
+  <path d="M56 94c0-15.5 11.6-27 26-27s26 11.5 26 27v6H56z" fill="#ffffff" fill-opacity="0.5"/>
+  <!-- The person in front: you. -->
+  <circle cx="48" cy="52" r="18" fill="#ffffff"/>
+  <path d="M16 106c0-18.8 14.3-32 32-32s32 13.2 32 32v6H16z" fill="#ffffff"/>
+</svg>

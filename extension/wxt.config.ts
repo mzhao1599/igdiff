@@ -24,7 +24,7 @@ export default defineConfig({
   webExt: {
     disabled: true,
   },
-  manifest: ({ mode }) => ({
+  manifest: ({ mode, browser }) => ({
     name: mode === 'production' ? 'Follower Tracker' : 'Follower Tracker (dev)',
     description:
       'See who does not follow you back, your mutuals, and who unfollowed you. Runs locally in your browser.',
@@ -34,7 +34,21 @@ export default defineConfig({
     host_permissions: ['https://www.instagram.com/*'],
     action: {
       default_title: 'Follower Tracker',
+      default_icon: { 16: 'icon/16.png', 32: 'icon/32.png', 48: 'icon/48.png' },
     },
+    ...(browser === 'firefox'
+      ? {
+          browser_specific_settings: {
+            gecko: {
+              // Placeholder until the final name is chosen.
+              id: 'follower-tracker@extension',
+              strict_min_version: '115.0',
+              // Nothing leaves the user's device except requests to Instagram itself.
+              data_collection_permissions: { required: ['none'] },
+            },
+          },
+        }
+      : {}),
   }),
   hooks: {
     // `entrypoints:grouped` only runs for real builds (not `wxt prepare`), so the

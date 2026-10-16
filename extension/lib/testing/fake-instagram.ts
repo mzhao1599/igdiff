@@ -39,6 +39,10 @@ export interface FakeInstagramOptions {
    * or refused with a 400.
    */
   readonly orderBehavior?: 'ignored' | 'all-in-one' | 'rejected';
+  /** The current unfollow endpoint answers with the HTML app page, like a removed route. */
+  readonly destroyGone?: boolean;
+  /** The current unfollow endpoint answers with a bare JSON 404, as seen on a real account. */
+  readonly destroy404?: boolean;
   /** Overrides for show_many. `null` leaves an account out of the response (deactivated/unavailable). */
   readonly friendships?: Readonly<Record<string, { following?: boolean; followed_by?: boolean } | null>>;
   /** Return a Response to replace the default answer for a request. */
@@ -76,6 +80,7 @@ export function createFakeInstagram(options: FakeInstagramOptions = {}) {
   const followers = options.followers ?? [];
   const requests: FakeRequest[] = [];
   const counts = new Map<string, number>();
+  const unfollowed: string[] = [];
 
   const page = (
     list: readonly FakeAccount[],
@@ -137,6 +142,24 @@ export function createFakeInstagram(options: FakeInstagramOptions = {}) {
     if (url.pathname === `/api/v1/friendships/${viewerId}/followers/`) {
       return page(followers, url.searchParams, options.followersChunk);
     }
+    const unfollow =
+      /^\/api\/v1\/friendships\/destroy\/([^/]+)\/$/.exec(url.pathname) ??
+      /^\/web\/friendships\/([^/]+)\/unfollow\/$/.exec(url.pathname);
+    if (unfollow && method === 'POST') {
+      const id = decodeURIComponent(unfollow[1]!);
+      const viaDestroy = url.pathname.startsWith('/api/v1/');
+      if (viaDestroy && options.destroyGone) {
+        return html('<!doctype html><html>app</html>');
+      }
+      if (viaDestroy && options.destroy404) {
+        return json({ status: 'fail' }, 404);
+      }
+      if (!following.some(account => account.pk === id)) {
+        return json({ message: 'User not found', status: 'fail' }, 404);
+      }
+      unfollowed.push(id);
+      return json(viaDestroy ? { friendship_status: { following: false }, status: 'ok' } : { status: 'ok' });
+    }
     const single = /^\/api\/v1\/friendships\/show\/([^/]+)\/$/.exec(url.pathname);
     if (single && method === 'GET') {
       const id = decodeURIComponent(single[1]!);
@@ -146,7 +169,7 @@ export function createFakeInstagram(options: FakeInstagramOptions = {}) {
       }
       return json({
         ...(override ?? {
-          following: following.some(account => account.pk === id),
+          following: following.some(account => account.pk === id) && !unfollowed.includes(id),
           followed_by: followers.some(account => account.pk === id),
         }),
         status: 'ok',
@@ -171,7 +194,7 @@ export function createFakeInstagram(options: FakeInstagramOptions = {}) {
   };
 
   const client: InstagramClient = { fetch: fetchImpl as typeof fetch, csrfToken: () => 'csrf-test' };
-  return { client, requests, viewerId };
+  return { client, requests, viewerId, unfollowed };
 }
 
 export function accounts(...pks: string[]): FakeAccount[] {

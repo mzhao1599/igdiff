@@ -2,7 +2,7 @@
 
 A local-only browser extension that tracks your Instagram follow lists: who doesn't follow you back, your mutuals, your fans, and who unfollowed you over time. No exports, no extra login, no servers. Data stays in the extension's own IndexedDB.
 
-> **Status:** the collector, snapshot store, diff engine and automatic daily sync work and have been verified on a real account. There's no user-facing UI yet, only a dev-only diagnostics page. The legacy app in the repo root is untouched.
+> **Status:** working and verified on a real account: automatic daily sync, the snapshot history, and a side panel that lists who doesn't follow you back, your fans, mutuals and changes. You can unfollow accounts one at a time or in a batch. The legacy app in the repo root is untouched.
 
 ## Develop
 
@@ -24,7 +24,7 @@ Instagram only works in a profile where you're already signed in, so WXT does no
 1. Run `npm run build:dev`.
 2. Open `chrome://extensions`, turn on **Developer mode**, click **Load unpacked**, and pick `.output/chrome-mv3-dev`.
 3. Open or reload a `https://www.instagram.com` tab where you're signed in. About 10 seconds later it offers to sync, and the first sync runs automatically.
-4. Click the extension's toolbar icon. In dev builds it opens the diagnostics page: probe, Sync now, the automatic-sync schedule, and the stored data.
+4. Click the extension's toolbar icon to open the side panel. In dev builds its footer links to the diagnostics page (probe, Sync now, the automatic-sync schedule, raw stored data).
 
 After a code change, rebuild and reload the extension (on `chrome://extensions`, or with the dev bridge below), then reload the Instagram tab.
 
@@ -57,9 +57,10 @@ await ft('scheduler');
 | `scheduler` | Automatic-sync status: last sync, next due, budget used, interrupted sync. |
 | `trigger` | Runs the automatic check now, skipping the one-day wait. |
 | `setAuto` | Turns automatic syncing on or off (`true` / `false`). |
+| `unfollowStatus` | Current unfollow job and today's allowance (read-only). |
 | `reload` | Reloads the extension from disk. Reload the Instagram tab afterwards. |
 
-All of these only read from Instagram.
+All of these only read from Instagram. Unfollowing is deliberately not available through the bridge: page scripts must never be able to change the account.
 
 ## How it works
 
@@ -85,6 +86,10 @@ Instagram tab loads ──autosync:ready──► background ──collector:run
 | `lib/scheduler/state.ts` | Scheduler settings, attempts and budget in `storage.local`; the lease in `storage.session`. |
 | `entrypoints/background.ts` | Runs the scheduler: picks a tab, holds the lease, saves checkpoints, commits results. |
 | `entrypoints/instagram.content.ts` | Runs the collector in the page. Renders nothing and stores nothing. |
+| `lib/actions/unfollow.ts` | Paced unfollow runner: endpoint fallback, stops at the first block, skips missing accounts. |
+| `lib/actions/limits.ts` | Daily unfollow limit and the 24 h pause after a block. |
+| `lib/panel/view.ts` | What the side panel shows: lists minus just-unfollowed accounts, search, estimates. |
+| `entrypoints/sidepanel/` | The user-facing UI. |
 | `entrypoints/diagnostics/` | Dev-only page. Stripped from production builds. |
 | `lib/devBridge.ts` | Dev-only page ↔ extension bridge. Stripped from production builds. |
 
@@ -96,13 +101,23 @@ Instagram tab loads ──autosync:ready──► background ──collector:run
 - **Budget:** 600 requests per account per day by default. A sync only starts when the remaining budget covers the last sync's cost, and the collector stops at the cap.
 - **Back-off:** after a rate limit or a sign-in or challenge problem, wait 6 h; after an error, 2 h; after Stop, 12 h.
 
+### Unfollowing
+
+- **Only on your click:** per row (with an inline "Sure?"), or for a selection or Select all, after a confirmation that shows how long it will take. Accounts you star (Keep) are never unfollowed, and the background checks this again.
+- **Runs in your Instagram tab, slowly:** about 15–35 s between unfollows and a 5-minute break after every 10. At most 100 unfollows per account per day.
+- **Stops at the first sign of trouble:** an action block ("Try Again Later"), a 429, "please wait", or a sign-in or challenge page. After a block, unfollowing pauses for 24 hours.
+- **Safe to interrupt:** close or reload the tab, or press Stop, and the remaining accounts stay queued until you press Resume. A job never resumes on its own.
+- **Never the wrong account:** the side panel sends the account it shows, and the background refuses if the Instagram tab is signed in to a different one.
+- **Success has to be confirmed:** only a JSON "ok" from Instagram (with `following: false` when Instagram reports it) counts. An HTML page with status 200 doesn't.
+- Accounts you unfollow drop out of "don't follow back" right away. The next sync records them as "You unfollowed".
+
 ### Safety rules the code enforces
 
 - **Only completed syncs are saved.** Rate limits, sign-in or challenge pages, page caps, a stop, the budget, or an empty list where data was expected all leave stored data untouched.
 - **"Unfollowed you" means they left your followers list,** not that they don't follow back. Following someone new never produces an unfollow event.
 - **Every apparent loss is re-checked** before it's recorded: in bulk, or one by one when Instagram refuses the bulk check. A loss is restored (the list skipped them), `confirmed`, or `unconfirmed` (Instagram returned nothing, e.g. a deactivated account).
 - **Mass unexplained changes are rejected.** If more than max(25, 20%) of followers or follows vanish without confirmation, the snapshot is rejected and the previous one is kept.
-- **Read-only.** There are no follow, unfollow, like or comment calls.
+- **Reading is automatic, writing never is.** Syncs only read. The single write action, unfollow, runs only from your click in the side panel. There are no follow, like or comment calls.
 
 ## Provenance
 

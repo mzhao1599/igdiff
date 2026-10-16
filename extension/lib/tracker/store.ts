@@ -12,6 +12,9 @@
  * A sync in progress is checkpointed in `checkpoints` (cursor and counters per
  * list) and `checkpointUsers` (accounts collected so far), so an interrupted
  * run can continue instead of starting over. Checkpoints are never snapshots.
+ *
+ * `keep` holds accounts the user protected from unfollowing; `actions` logs
+ * every unfollow the extension made on the user's behalf.
  */
 import { openDB, type DBSchema, type IDBPDatabase, type IDBPTransaction } from 'idb';
 import type {
@@ -28,7 +31,7 @@ import { DEFAULT_COMMIT_GUARD, planCommit, type CommitGuard, type RejectReason, 
 import type { FollowSets } from './diff';
 
 export const DB_NAME = 'follower-tracker';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 /** Snapshots whose full id lists are kept. Older ones keep counts only. */
 export const KEEP_LISTS_FOR_SNAPSHOTS = 3;
 
@@ -139,6 +142,24 @@ export interface LoadedCheckpoint {
   readonly resume: ResumeState;
 }
 
+export interface KeepRecord {
+  readonly viewerId: string;
+  readonly pk: string;
+  readonly addedAt: number;
+}
+
+export type ActionOutcome = 'unfollowed' | 'not_found' | 'failed';
+
+export interface ActionRecord {
+  readonly id: number;
+  readonly viewerId: string;
+  readonly pk: string;
+  readonly type: 'unfollow';
+  readonly outcome: ActionOutcome;
+  readonly detail: string | null;
+  readonly at: number;
+}
+
 type WithoutId<T extends { id: number }> = Omit<T, 'id'> & { id?: number };
 
 interface TrackerSchema extends DBSchema {
@@ -153,6 +174,8 @@ interface TrackerSchema extends DBSchema {
     value: CheckpointUserRecord;
     indexes: { byViewer: string; byList: [string, string] };
   };
+  keep: { key: [string, string]; value: KeepRecord; indexes: { byViewer: string } };
+  actions: { key: number; value: WithoutId<ActionRecord>; indexes: { byViewer: [string, number] } };
 }
 
 type StoreName = 'accounts' | 'snapshots' | 'snapshotLists' | 'profiles' | 'events';
@@ -201,6 +224,11 @@ export class TrackerStore {
           const users = database.createObjectStore('checkpointUsers', { keyPath: ['viewerId', 'list', 'pk'] });
           users.createIndex('byViewer', 'viewerId');
           users.createIndex('byList', ['viewerId', 'list']);
+        }
+        if (oldVersion < 3) {
+          database.createObjectStore('keep', { keyPath: ['viewerId', 'pk'] }).createIndex('byViewer', 'viewerId');
+          const actions = database.createObjectStore('actions', { keyPath: 'id', autoIncrement: true });
+          actions.createIndex('byViewer', ['viewerId', 'at']);
         }
       },
     });
@@ -488,8 +516,47 @@ export class TrackerStore {
     await tx.done;
   }
 
+  async listKeep(viewerId: string): Promise<Set<string>> {
+    const records = await this.db.getAllFromIndex('keep', 'byViewer', viewerId);
+    return new Set(records.map(record => record.pk));
+  }
+
+  async setKeep(viewerId: string, pks: readonly string[], keep: boolean, now: number): Promise<void> {
+    const tx = this.db.transaction('keep', 'readwrite');
+    await Promise.all(
+      pks.map(pk => (keep ? tx.store.put({ viewerId, pk, addedAt: now }) : tx.store.delete([viewerId, pk]))),
+    );
+    await tx.done;
+  }
+
+  async recordAction(action: Omit<ActionRecord, 'id'>): Promise<void> {
+    await this.db.add('actions', action);
+  }
+
+  /** Newest first; `since` limits to actions at or after that time. */
+  async listActions(viewerId: string, since = -Infinity, limit = 500): Promise<ActionRecord[]> {
+    const out: ActionRecord[] = [];
+    let cursor = await this.db
+      .transaction('actions')
+      .store.index('byViewer')
+      .openCursor(IDBKeyRange.bound([viewerId, since], [viewerId, Infinity]), 'prev');
+    while (cursor && out.length < limit) {
+      out.push(cursor.value as ActionRecord);
+      cursor = await cursor.continue();
+    }
+    return out;
+  }
+
   async deleteAccount(viewerId: string): Promise<void> {
     await this.clearCheckpoint(viewerId);
+    const actionsTx = this.db.transaction(['keep', 'actions'], 'readwrite');
+    const keepKeys = await actionsTx.objectStore('keep').index('byViewer').getAllKeys(viewerId);
+    const actionKeys = await actionsTx.objectStore('actions').index('byViewer').getAllKeys(viewerTimeRange(viewerId));
+    await Promise.all([
+      ...keepKeys.map(key => actionsTx.objectStore('keep').delete(key)),
+      ...actionKeys.map(key => actionsTx.objectStore('actions').delete(key)),
+    ]);
+    await actionsTx.done;
     const tx = this.db.transaction(ALL_STORES, 'readwrite');
     const deletes: Array<Promise<unknown>> = [tx.objectStore('accounts').delete(viewerId)];
     for (const name of ['snapshots', 'events'] as const) {

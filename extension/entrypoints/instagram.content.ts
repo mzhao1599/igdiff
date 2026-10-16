@@ -1,11 +1,12 @@
 import { browser } from 'wxt/browser';
 import { defineContentScript } from 'wxt/utils/define-content-script';
+import { runUnfollows } from '../lib/actions/unfollow';
 import { collect, type CollectionProgress } from '../lib/collector/collect';
 import { runProbe } from '../lib/collector/probe';
 import { installDevBridge } from '../lib/devBridge';
 import { BUILD_ID, DIAGNOSTICS_ENABLED } from '../lib/env';
 import type { InstagramClient } from '../lib/instagram/api';
-import { readSession } from '../lib/instagram/session';
+import { readSession, readWebClientHeaders } from '../lib/instagram/session';
 import {
   broadcast,
   handleMessages,
@@ -18,6 +19,8 @@ import {
 const HEARTBEAT_MS = 5_000;
 /** Let Instagram finish loading before offering to sync. */
 const READY_DELAY_MS = 10_000;
+/** Value the Instagram web client has sent as X-ASBD-ID; not read from the page (it isn't exposed there). */
+const WEB_ASBD_ID = '359341';
 
 /**
  * Runs on www.instagram.com only. Collection has to happen here: requests made
@@ -29,15 +32,29 @@ export default defineContentScript({
   matches: ['https://www.instagram.com/*'],
   runAt: 'document_idle',
   main(ctx) {
+    // The page's HTML is large; read Instagram's revision from it once, lazily, on the first write.
+    let pageHtml: string | null = null;
+    // Firefox runs content-script fetch() as the extension; content.fetch() runs it as the page,
+    // with the page's cookies, which is what these requests need. Chrome's fetch already does.
+    const pageFetch: typeof fetch =
+      (globalThis as { content?: { fetch?: typeof fetch } }).content?.fetch?.bind(
+        (globalThis as { content?: object }).content,
+      ) ?? window.fetch.bind(window);
     const client: InstagramClient = {
-      fetch: (input, init) => window.fetch(input, init),
+      fetch: (input, init) => pageFetch(input, init),
       csrfToken: () => readSession(document.cookie).csrfToken,
+      webClientHeaders: () =>
+        readWebClientHeaders(window.sessionStorage, () => (pageHtml ??= document.documentElement.innerHTML), WEB_ASBD_ID),
     };
     let running: AbortController | null = null;
     let lastProgress: CollectionProgress | null = null;
+    let unfollowing: AbortController | null = null;
 
-    // Extension reloaded or updated: this copy of the script is orphaned, so stop any sync.
-    ctx.onInvalidated(() => running?.abort());
+    // Extension reloaded or updated: this copy of the script is orphaned, so stop everything.
+    ctx.onInvalidated(() => {
+      running?.abort();
+      unfollowing?.abort();
+    });
 
     handleMessages<ContentRequest>(message => {
       switch (message.type) {
@@ -91,6 +108,34 @@ export default defineContentScript({
           running?.abort();
           return Promise.resolve({ stopping: wasRunning });
         }
+        case 'unfollow:run': {
+          // Only ever sent after the user chose these accounts in the side panel.
+          if (unfollowing) {
+            return Promise.resolve({ started: false });
+          }
+          const controller = new AbortController();
+          const { jobId } = message;
+          unfollowing = controller;
+          void runUnfollows({
+            client,
+            viewerId: readSession(document.cookie).viewerId,
+            pks: message.pks,
+            maxUnfollows: message.maxUnfollows,
+            signal: controller.signal,
+            onItem: item => broadcast({ type: 'unfollow:item', jobId, item }),
+            onProgress: progress => broadcast({ type: 'unfollow:progress', jobId, progress }),
+          })
+            .then(result => broadcast({ type: 'unfollow:finished', jobId, result }))
+            .finally(() => {
+              unfollowing = null;
+            });
+          return Promise.resolve({ started: true });
+        }
+        case 'unfollow:stop': {
+          const wasRunning = unfollowing !== null;
+          unfollowing?.abort();
+          return Promise.resolve({ stopping: wasRunning });
+        }
         default:
           return undefined;
       }
@@ -112,6 +157,8 @@ export default defineContentScript({
         stop: () => sendToBackground({ type: 'sync:stop' }),
         summary: () => sendToBackground({ type: 'dev:summary' }),
         scheduler: () => sendToBackground({ type: 'scheduler:status' }),
+        // Read-only. Starting an unfollow is deliberately not a bridge command: page scripts must never change the account.
+        unfollowStatus: () => sendToBackground({ type: 'unfollow:status', viewerId: readSession(document.cookie).viewerId }),
         trigger: () => sendToBackground({ type: 'scheduler:trigger' }),
         setAuto: args => sendToBackground({ type: 'scheduler:set', enabled: Boolean(args) }),
         reload: () => sendToBackground({ type: 'dev:reload' }),

@@ -15,6 +15,7 @@ import {
   parseResponseBody,
   STATUS_NETWORK_ERROR,
   STATUS_SOFT_BLOCK,
+  unfollowUser,
   type InstagramClient,
 } from './api';
 
@@ -294,5 +295,25 @@ describe('describeListShape list flags', () => {
       }),
     ).toMatchObject({ hiddenCount: 6, pageSizeField: 50, shouldLimitFollowers: false, shouldLimitFollowings: true });
     expect(describeListShape({ users: [] })).toMatchObject({ hiddenCount: null, pageSizeField: null });
+  });
+});
+
+describe('web client headers', () => {
+  it('are added to the unfollow request only, never to reads', async () => {
+    const seen: Array<{ url: string; headers: Record<string, string> }> = [];
+    const fake = createFakeInstagram({ following: [{ pk: '1' }] });
+    const client: InstagramClient = {
+      fetch: (input, init) => {
+        seen.push({ url: String(input), headers: init?.headers as Record<string, string> });
+        return fake.client.fetch(input, init);
+      },
+      csrfToken: () => 'csrf',
+      webClientHeaders: () => ({ 'x-ig-www-claim': 'claim', 'x-asbd-id': '1' }),
+    };
+    await fetchListPage(client, '1000', 'following');
+    await unfollowUser(client, '1', 'destroy');
+    const [read, write] = seen;
+    expect(read?.headers['x-ig-www-claim']).toBeUndefined();
+    expect(write?.headers).toMatchObject({ 'x-ig-www-claim': 'claim', 'x-asbd-id': '1', 'x-csrftoken': 'csrf' });
   });
 });

@@ -225,3 +225,29 @@ describe('TrackerStore upgrade', () => {
     indexedDB.deleteDatabase(name);
   });
 });
+
+describe('TrackerStore keep list and actions', () => {
+  it('keeps and un-keeps accounts per viewer', async () => {
+    await store.setKeep('A', ['1', '2'], true, 10);
+    await store.setKeep('B', ['9'], true, 10);
+    await store.setKeep('A', ['1'], false, 20);
+    expect([...(await store.listKeep('A'))]).toEqual(['2']);
+    expect([...(await store.listKeep('B'))]).toEqual(['9']);
+  });
+
+  it('logs unfollows newest first and filters by time', async () => {
+    await store.recordAction({ viewerId: 'A', pk: '1', type: 'unfollow', outcome: 'unfollowed', detail: null, at: 100 });
+    await store.recordAction({ viewerId: 'A', pk: '2', type: 'unfollow', outcome: 'not_found', detail: 'gone', at: 200 });
+    await store.recordAction({ viewerId: 'B', pk: '3', type: 'unfollow', outcome: 'unfollowed', detail: null, at: 300 });
+    expect((await store.listActions('A')).map(a => a.pk)).toEqual(['2', '1']);
+    expect((await store.listActions('A', 150)).map(a => a.pk)).toEqual(['2']);
+  });
+
+  it('deleting an account removes its keep list and actions too', async () => {
+    await store.setKeep('A', ['1'], true, 10);
+    await store.recordAction({ viewerId: 'A', pk: '1', type: 'unfollow', outcome: 'unfollowed', detail: null, at: 100 });
+    await store.deleteAccount('A');
+    expect((await store.listKeep('A')).size).toBe(0);
+    expect(await store.listActions('A')).toEqual([]);
+  });
+});

@@ -18,6 +18,9 @@ import type {
 } from './collector/collect';
 import type { ProbeReport } from './collector/probe';
 import type { Attempt, AutoSyncDecision } from './scheduler/policy';
+import type { UnfollowAllowance } from './actions/limits';
+import type { UnfollowJob } from './actions/state';
+import type { UnfollowItemResult, UnfollowProgress, UnfollowRunResult } from './actions/unfollow';
 import type { CommitOutcome } from './tracker/store';
 
 // Background → content script (via tabs.sendMessage).
@@ -32,7 +35,9 @@ export type ContentRequest =
       readonly maxRequests: number;
       readonly settings?: Partial<CollectorSettings>;
     }
-  | { readonly type: 'collector:stop' };
+  | { readonly type: 'collector:stop' }
+  | { readonly type: 'unfollow:run'; readonly jobId: string; readonly pks: readonly string[]; readonly maxUnfollows: number }
+  | { readonly type: 'unfollow:stop' };
 
 export interface CollectorStatus {
   /** Build of the content script answering. Older than the page's build means the tab needs a reload. */
@@ -61,6 +66,14 @@ export type BackgroundRequest =
   | { readonly type: 'scheduler:set'; readonly enabled: boolean }
   /** Run the automatic check now, ignoring the 24-hour wait and failure back-off. */
   | { readonly type: 'scheduler:trigger' }
+  /** Unfollow these accounts of `viewerId`. Refused if the Instagram tab is signed in to another account. */
+  | { readonly type: 'unfollow:start'; readonly viewerId: string; readonly pks: readonly string[] }
+  | { readonly type: 'unfollow:stop' }
+  | { readonly type: 'unfollow:resume' }
+  | { readonly type: 'unfollow:discard' }
+  | { readonly type: 'unfollow:status'; readonly viewerId: string | null }
+  /** The side panel is showing this account: its new unfollowers have been seen. */
+  | { readonly type: 'badge:clear'; readonly viewerId: string | null }
   // Dev builds only (see lib/devBridge.ts).
   | { readonly type: 'dev:reload' }
   | { readonly type: 'dev:summary' }
@@ -85,6 +98,24 @@ export type SyncStartResponse =
       readonly resumed: boolean;
     }
   | { readonly ok: false; readonly error: EnvProblem | 'already_running' | 'budget' };
+
+export type UnfollowStartError =
+  | EnvProblem
+  | 'wrong_account'
+  | 'already_running'
+  | 'nothing_to_do'
+  | 'blocked'
+  | 'daily_limit';
+
+export type UnfollowStartResponse =
+  | { readonly ok: true; readonly job: UnfollowJob }
+  | { readonly ok: false; readonly error: UnfollowStartError; readonly until?: number };
+
+export interface UnfollowStatus {
+  readonly job: UnfollowJob | null;
+  readonly allowance: UnfollowAllowance | null;
+  readonly today: number;
+}
 
 export interface SchedulerStatus {
   readonly enabled: boolean;
@@ -115,6 +146,11 @@ export type Broadcast =
   | { readonly type: 'collector:checkpoint'; readonly delta: CheckpointDelta }
   /** The scheduler started or released a sync; pages should refresh their status. */
   | { readonly type: 'scheduler:changed' }
+  | { readonly type: 'unfollow:item'; readonly jobId: string; readonly item: UnfollowItemResult }
+  | { readonly type: 'unfollow:progress'; readonly jobId: string; readonly progress: UnfollowProgress }
+  | { readonly type: 'unfollow:finished'; readonly jobId: string; readonly result: UnfollowRunResult }
+  /** The unfollow job or ledger changed; pages should refresh. */
+  | { readonly type: 'unfollow:changed' }
   | { readonly type: 'sync:committed'; readonly viewerId: string | null; readonly outcome: CommitOutcome };
 
 export type RuntimeMessage = BackgroundRequest | Broadcast;
