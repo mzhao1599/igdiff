@@ -154,8 +154,8 @@ function ProbeSection({ ready }: { ready: boolean }) {
     <section>
       <h2>Endpoint probe {report && <Badge value={report.verdict} />}</h2>
       <p class='muted'>
-        Up to 5 read-only requests (profile, first page of each list, one bulk and one single friendship check). The
-        report contains no usernames or ids, so you can paste it into an issue.
+        Up to 5 read-only requests, made the same way a sync makes them (profile, first page of each list, one bulk and
+        one single friendship check). The report contains no usernames or ids, so you can paste it into an issue.
       </p>
       <div class='row'>
         <button class='primary' disabled={!ready || busy} onClick={() => void run()}>
@@ -185,12 +185,7 @@ function ProbeSection({ ready }: { ready: boolean }) {
                     <div class='muted'>{step.endpoint}</div>
                   </td>
                   <td>
-                    {step.experiment ? (
-                      <span class='muted'>{step.ok ? 'answered' : 'refused'}</span>
-                    ) : (
-                      <Badge value={step.ok ? 'ok' : 'failed'} />
-                    )}{' '}
-                    {step.status}
+                    <Badge value={step.ok ? 'ok' : 'failed'} /> {step.status}
                   </td>
                   <td>{step.ms} ms</td>
                   <td>
@@ -244,6 +239,11 @@ function resultWarnings(result: CollectionResult): string[] {
       result.stats.singleChecks > 0
         ? `The bulk friendship check was refused, so ${result.stats.singleChecks} apparent changes were checked one by one.`
         : 'The bulk friendship check was refused, so accounts the lists could not settle were left as they are.',
+    );
+  }
+  if (stats.orderFallback.length > 0) {
+    warnings.push(
+      `Instagram refused the date-sorted request for ${stats.orderFallback.join(' and ')}, so the default order was paged instead. That order can shift while paging.`,
     );
   }
   if (result.stats.singleCheckUnavailable) {
@@ -346,7 +346,10 @@ function SyncSection({
             </p>
           ))}
           <p class='muted' style={{ margin: '8px 0 0' }}>
-            Took {formatSeconds(result.finishedAt - result.startedAt)} and {result.stats.requests} requests.
+            Took {formatSeconds(result.finishedAt - result.startedAt)} and {result.stats.requests} requests (following in{' '}
+            {result.stats.followingPages} {result.stats.followingPages === 1 ? 'page' : 'pages'}, followers in{' '}
+            {result.stats.followersPages} {result.stats.followersPages === 1 ? 'page' : 'pages'}
+            {result.stats.listOrder ? ', sorted by date followed' : ''}).
           </p>
           <details style={{ marginTop: '8px' }}>
             <summary>Collection stats</summary>

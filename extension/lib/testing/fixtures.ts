@@ -35,6 +35,8 @@ export function makeResult(patch: Partial<CollectionResult> = {}): CollectionRes
       profileUnavailable: false,
       bulkCheckUnavailable: false,
       singleCheckUnavailable: false,
+      listOrder: null,
+      orderFallback: [],
     },
     ...patch,
   };

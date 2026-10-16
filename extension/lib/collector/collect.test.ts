@@ -371,11 +371,50 @@ describe('collect: speed', () => {
   });
 });
 
+describe('collect: sorted lists', () => {
+  it('requests both lists sorted by date followed', async () => {
+    const { promise, fake } = run({ following: accounts('1'), followers: accounts('1') });
+    const result = await promise;
+    const lists = fake.requests.filter(r => /\/(following|followers)\/$/.test(r.path));
+    expect(lists.every(r => r.params.get('order') === 'date_followed_latest')).toBe(true);
+    expect(result.stats.listOrder).toBe('date_followed_latest');
+  });
+
+  it('takes a whole list in one request when Instagram sends it all', async () => {
+    const many = accounts(...Array.from({ length: 120 }, (_, i) => String(i)));
+    const { promise } = run({ following: many, followers: many, followingChunk: 50, followersChunk: 24, orderBehavior: 'all-in-one' });
+    const result = await promise;
+    expect(result.outcome).toBe('completed');
+    expect(result.stats.followingPages).toBe(1);
+    expect(result.stats.followersPages).toBe(1);
+    expect(result.followingIds).toHaveLength(120);
+  });
+
+  it('falls back to default paging when Instagram refuses the sort', async () => {
+    const { promise } = run({
+      following: accounts('1', '2', '3'),
+      followers: accounts('2'),
+      followingChunk: 2,
+      orderBehavior: 'rejected',
+    });
+    const result = await promise;
+    expect(result.outcome).toBe('completed');
+    expect([...result.stats.orderFallback].sort()).toEqual(['followers', 'following']);
+    expect(sorted(result.followingIds)).toEqual(['1', '2', '3']);
+  });
+
+  it('pages in default order when no sort is configured', async () => {
+    const { promise, fake } = run({ following: accounts('1') }, { settings: { listOrder: null } });
+    await promise;
+    expect(fake.requests.some(r => r.params.has('order'))).toBe(false);
+  });
+});
+
 describe('collect: when friendship checks are refused', () => {
   const htmlEverywhere = (path: string) => (r: { path: string }) => (r.path.endsWith(path) ? html('<html/>') : undefined);
 
-  it('retries the bulk check once, quickly, then completes without it', async () => {
-    const { promise, fake, sleeps } = run({
+  it('gives up on the bulk check at once when it answers with the HTML app page', async () => {
+    const { promise, fake } = run({
       following: accounts('1', '2'),
       followers: accounts('2'),
       intercept: htmlEverywhere('/show_many/'),
@@ -383,9 +422,21 @@ describe('collect: when friendship checks are refused', () => {
     const result = await promise;
     expect(result.outcome).toBe('completed');
     expect(result.stats.bulkCheckUnavailable).toBe(true);
+    expect(fake.requests.filter(r => r.path.endsWith('/show_many/'))).toHaveLength(1);
+    expect(sorted(result.followerIds)).toEqual(['2']);
+  });
+
+  it('retries a rate-limited bulk check once, quickly, then completes without it', async () => {
+    const { promise, fake, sleeps } = run({
+      following: accounts('1', '2'),
+      followers: accounts('2'),
+      intercept: r => (r.path.endsWith('/show_many/') ? json({}, 429) : undefined),
+    });
+    const result = await promise;
+    expect(result.outcome).toBe('completed');
+    expect(result.stats.bulkCheckUnavailable).toBe(true);
     expect(fake.requests.filter(r => r.path.endsWith('/show_many/'))).toHaveLength(2);
     expect(sleeps.every(ms => ms < DEFAULT_COLLECTOR_SETTINGS.throttleBackoffMs)).toBe(true);
-    expect(sorted(result.followerIds)).toEqual(['2']);
   });
 
   it('falls back to one-by-one checks for apparent changes', async () => {

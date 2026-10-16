@@ -1,12 +1,11 @@
 /**
- * Read-only health check of the endpoints the collector depends on.
+ * Read-only health check of the endpoints the collector depends on, requested
+ * exactly the way a sync requests them (same sort order).
  *
- * Makes at most five requests (profile, first following page, first followers
- * page, one small bulk friendship check, one single friendship check) and
- * reports status, latency and response shape, plus up to three experiments
- * (bigger follower pages, a date-sorted following list) that never affect the
- * verdict. The report carries no usernames or ids, so it is safe to paste into
- * a bug report.
+ * Makes at most five requests (profile, first page of each list, one small bulk
+ * friendship check, one single friendship check) and reports status, latency
+ * and response shape. The report carries no usernames or ids, so it is safe to
+ * paste into a bug report.
  */
 import {
   fetchFriendshipStatus,
@@ -18,11 +17,12 @@ import {
   type FailureInfo,
   type InstagramClient,
   type ListKind,
-  type ListPage,
+  type ListOrder,
   type ListPageShape,
   type ResponseInfo,
 } from '../instagram/api';
 import type { InstagramSession } from '../instagram/session';
+import { DEFAULT_COLLECTOR_SETTINGS } from './collect';
 
 export type ProbeVerdict = 'ok' | 'degraded' | 'failed' | 'signed_out';
 
@@ -36,8 +36,6 @@ export interface ProbeStep {
   readonly failure: FailureInfo | null;
   readonly response: ResponseInfo | null;
   readonly shape?: ListPageShape;
-  /** Experiments show what Instagram allows; they never change the verdict. */
-  readonly experiment?: true;
 }
 
 export interface ProbeReport {
@@ -51,6 +49,8 @@ export interface ProbeOptions {
   readonly client: InstagramClient;
   readonly session: InstagramSession;
   readonly pageSize?: number;
+  /** Defaults to the order a sync uses. */
+  readonly order?: ListOrder | null;
   readonly now?: () => number;
 }
 
@@ -127,10 +127,10 @@ export async function runProbe(options: ProbeOptions): Promise<ProbeReport> {
       : failureNotes(profile.result, false),
   });
 
+  const order = options.order === undefined ? DEFAULT_COLLECTOR_SETTINGS.listOrder : options.order;
   let samplePks: string[] = [];
-  let defaultFollowingPks: string[] = [];
   for (const kind of ['following', 'followers'] as ListKind[]) {
-    const page = await timed(now, () => fetchListPage(client, viewerId, kind, { count: options.pageSize }));
+    const page = await timed(now, () => fetchListPage(client, viewerId, kind, { count: options.pageSize, order }));
     const data = page.result.data;
     const reportedTotal = kind === 'following' ? reported?.followingCount : reported?.followerCount;
     const notes: string[] = [];
@@ -151,14 +151,13 @@ export async function runProbe(options: ProbeOptions): Promise<ProbeReport> {
       }
       if (kind === 'following') {
         samplePks = data.users.slice(0, 5).map(user => user.pk);
-        defaultFollowingPks = data.users.map(user => user.pk);
       }
     } else {
       notes.push(...failureNotes(page.result, false));
     }
     steps.push({
       name: kind === 'following' ? 'Following list, page 1' : 'Followers list, page 1',
-      endpoint: `GET /api/v1/friendships/{id}/${kind}/`,
+      endpoint: `GET /api/v1/friendships/{id}/${kind}/${order ? `?order=${order}` : ''}`,
       status: page.result.status,
       ok,
       ms: page.ms,
@@ -204,63 +203,7 @@ export async function runProbe(options: ProbeOptions): Promise<ProbeReport> {
     });
   }
 
-  const core = steps.slice();
-  const listsOk = core.filter(step => step.endpoint.includes('/friendships/{id}/')).every(step => step.ok);
-
-  if (listsOk) {
-    const experiment = async (
-      name: string,
-      kind: ListKind,
-      endpoint: string,
-      options: Parameters<typeof fetchListPage>[3],
-      describe: (page: ListPage) => string[],
-    ) => {
-      const page = await timed(now, () => fetchListPage(client, viewerId, kind, options));
-      const data = page.result.data;
-      steps.push({
-        name,
-        endpoint,
-        status: page.result.status,
-        ok: data !== null,
-        ms: page.ms,
-        failure: page.result.failure,
-        response: page.result.response ?? null,
-        notes: data ? describe(data) : failureNotes(page.result, false),
-        experiment: true,
-      });
-    };
-    const pageNotes = (page: ListPage) => {
-      const cursor = cursorNote(page.shape);
-      return [`${page.users.length} users on page 1`, ...(cursor ? [cursor] : [])];
-    };
-
-    await experiment(
-      'Experiment: followers, 200 per page',
-      'followers',
-      'GET /api/v1/friendships/{id}/followers/?count=200',
-      { count: 200 },
-      pageNotes,
-    );
-    await experiment(
-      'Experiment: followers, 200 per page, no search_surface',
-      'followers',
-      'GET /api/v1/friendships/{id}/followers/?count=200 (no search_surface)',
-      { count: 200, searchSurface: false },
-      pageNotes,
-    );
-    await experiment(
-      'Experiment: following sorted by date followed',
-      'following',
-      'GET /api/v1/friendships/{id}/following/?order=date_followed_latest',
-      { count: options.pageSize, order: 'date_followed_latest' },
-      page => {
-        const pks = page.users.map(user => user.pk);
-        const sameOrder = pks.length === defaultFollowingPks.length && pks.every((pk, i) => pk === defaultFollowingPks[i]);
-        return [...pageNotes(page), sameOrder ? 'same order as default (param ignored?)' : 'different order from default'];
-      },
-    );
-  }
-
-  const verdict: ProbeVerdict = !listsOk ? 'failed' : core.every(step => step.ok) ? 'ok' : 'degraded';
+  const listsOk = steps.filter(step => step.endpoint.includes('/friendships/{id}/')).every(step => step.ok);
+  const verdict: ProbeVerdict = !listsOk ? 'failed' : steps.every(step => step.ok) ? 'ok' : 'degraded';
   return { ranAt, verdict, session: sessionInfo, steps };
 }

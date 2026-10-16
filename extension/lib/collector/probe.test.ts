@@ -9,9 +9,8 @@ describe('runProbe', () => {
     const fake = createFakeInstagram({ following: accounts('1', '2'), followers: accounts('2') });
     const report = await runProbe({ client: fake.client, session });
     expect(report.verdict).toBe('ok');
-    expect(report.steps.filter(step => !step.experiment).map(step => step.ok)).toEqual([true, true, true, true, true]);
-    expect(report.steps.filter(step => step.experiment)).toHaveLength(3);
-    expect(fake.requests).toHaveLength(8);
+    expect(report.steps.map(step => step.ok)).toEqual([true, true, true, true, true]);
+    expect(fake.requests).toHaveLength(5);
   });
 
   it('fails when a list endpoint returns an empty first page despite a positive count', async () => {
@@ -50,30 +49,18 @@ describe('runProbe', () => {
     expect(report.steps[1]!.notes).toContain('cursor is a plain offset');
   });
 
-  it('never lets a refused experiment change the verdict', async () => {
+  it('asks for the lists the same way a sync does', async () => {
     const fake = createFakeInstagram({
-      following: accounts('1'),
+      following: accounts('1', '2', '3'),
       followers: accounts('1'),
-      intercept: r => (r.params.get('count') === '200' ? json({ message: 'bad count', status: 'fail' }, 400) : undefined),
+      followingChunk: 1,
+      orderBehavior: 'all-in-one',
     });
     const report = await runProbe({ client: fake.client, session });
-    expect(report.verdict).toBe('ok');
-    expect(report.steps.filter(step => step.experiment && !step.ok)).toHaveLength(2);
-  });
-
-  it('reports how many followers a 200-per-page request returns', async () => {
-    const fake = createFakeInstagram({ following: accounts('1'), followers: accounts(...Array.from({ length: 150 }, (_, i) => String(i))) });
-    const report = await runProbe({ client: fake.client, session });
-    expect(report.steps.find(step => step.name === 'Experiment: followers, 200 per page')?.notes[0]).toBe('150 users on page 1');
-  });
-
-  it('tells whether the sort-order parameter changed the following list', async () => {
-    const following = accounts('1', '2', '3');
-    const honored = await runProbe({ client: createFakeInstagram({ following, supportsOrder: true }).client, session });
-    const ignored = await runProbe({ client: createFakeInstagram({ following }).client, session });
-    const sortNote = (r: typeof honored) => r.steps.find(step => step.name.includes('sorted'))!.notes.join(' ');
-    expect(sortNote(honored)).toMatch(/different order/);
-    expect(sortNote(ignored)).toMatch(/same order/);
+    const listRequests = fake.requests.filter(r => /\/(following|followers)\/$/.test(r.path));
+    expect(listRequests.every(r => r.params.get('order') === 'date_followed_latest')).toBe(true);
+    expect(report.steps[1]!.notes).toContain('3 users on page 1 (3 raw)');
+    expect(report.steps[1]!.notes).toContain('no next page cursor');
   });
 
   it('shows how many accounts Instagram hides from the following list', async () => {

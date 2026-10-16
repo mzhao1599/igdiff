@@ -33,8 +33,12 @@ export interface FakeInstagramOptions {
   readonly reportedFollowing?: number | null;
   /** Sent as `hidden_following_account_count` on following pages. */
   readonly hiddenFollowing?: number;
-  /** Honor `order=date_followed_latest` by reversing the following list. */
-  readonly supportsOrder?: boolean;
+  /**
+   * How `order=…` is treated on both lists: ignored (default), answered with the
+   * whole list in one page (what Instagram did for following on a real account),
+   * or refused with a 400.
+   */
+  readonly orderBehavior?: 'ignored' | 'all-in-one' | 'rejected';
   /** Overrides for show_many. `null` leaves an account out of the response (deactivated/unavailable). */
   readonly friendships?: Readonly<Record<string, { following?: boolean; followed_by?: boolean } | null>>;
   /** Return a Response to replace the default answer for a request. */
@@ -80,7 +84,8 @@ export function createFakeInstagram(options: FakeInstagramOptions = {}) {
     extra: Record<string, unknown> = {},
   ) => {
     const offset = Number(params.get('max_id') ?? '0');
-    const size = Math.min(Number(params.get('count') ?? '50'), chunk ?? Infinity);
+    const allInOne = options.orderBehavior === 'all-in-one' && params.has('order');
+    const size = allInOne ? list.length : Math.min(Number(params.get('count') ?? '50'), chunk ?? Infinity);
     const slice = list.slice(offset, offset + size);
     const next = offset + size < list.length ? String(offset + size) : null;
     return json({
@@ -106,6 +111,9 @@ export function createFakeInstagram(options: FakeInstagramOptions = {}) {
     if (intercepted) {
       return intercepted;
     }
+    if (options.orderBehavior === 'rejected' && url.searchParams.has('order')) {
+      return json({ message: 'Invalid parameter', status: 'fail' }, 400);
+    }
 
     if (url.pathname === `/api/v1/users/${viewerId}/info/`) {
       return json({
@@ -119,10 +127,8 @@ export function createFakeInstagram(options: FakeInstagramOptions = {}) {
       });
     }
     if (url.pathname === `/api/v1/friendships/${viewerId}/following/`) {
-      const ordered =
-        options.supportsOrder && url.searchParams.get('order') === 'date_followed_latest' ? [...following].reverse() : following;
       return page(
-        ordered,
+        following,
         url.searchParams,
         options.followingChunk,
         options.hiddenFollowing === undefined ? {} : { hidden_following_account_count: options.hiddenFollowing },

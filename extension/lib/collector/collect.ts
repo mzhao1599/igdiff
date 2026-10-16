@@ -3,8 +3,11 @@
  *
  * Both lists are downloaded completely before anything is classified (the
  * legacy scanner learned that classifying page by page is unsafe). They are
- * fetched side by side, back to back, the way Instagram's own client pages
- * through them. Pacing only kicks in once Instagram pushes back with a 429.
+ * fetched side by side and requested sorted by date followed: on a real account
+ * that returned the whole following list in one response, while the default
+ * ranking reshuffles between pages and silently skips accounts. If Instagram
+ * refuses the sort, the list falls back to default paging. Pacing only kicks in
+ * once Instagram pushes back with a 429.
  *
  * Per-account `followed_by` flags are only trusted when they say `true`
  * (Instagram has returned stale `false`), so accounts the lists cannot settle
@@ -32,6 +35,7 @@ import {
   type IgUser,
   type InstagramClient,
   type ListKind,
+  type ListOrder,
 } from '../instagram/api';
 
 export type CollectionOutcome =
@@ -71,6 +75,8 @@ export interface CollectorSettings {
   readonly singleCheckDelayMs: number;
   readonly followingPageCap: number;
   readonly followersPageCap: number;
+  /** Sort to request. Date order is stable while paging; null uses Instagram's default ranking. */
+  readonly listOrder: ListOrder | null;
 }
 
 export const DEFAULT_COLLECTOR_SETTINGS: CollectorSettings = {
@@ -92,6 +98,7 @@ export const DEFAULT_COLLECTOR_SETTINGS: CollectorSettings = {
   singleCheckDelayMs: 400,
   followingPageCap: 1000,
   followersPageCap: 2000,
+  listOrder: 'date_followed_latest',
 };
 
 export interface Baseline {
@@ -150,6 +157,10 @@ export interface CollectionStats {
   bulkCheckUnavailable: boolean;
   /** The one-by-one fallback was refused too (or hit its limit). */
   singleCheckUnavailable: boolean;
+  /** Sort order the lists were requested in. */
+  listOrder: ListOrder | null;
+  /** Lists whose sorted request was refused and that were paged in default order instead. */
+  orderFallback: ListKind[];
 }
 
 export interface CollectionResult {
@@ -313,6 +324,8 @@ export async function collect(options: CollectorOptions): Promise<CollectionResu
     profileUnavailable: false,
     bulkCheckUnavailable: false,
     singleCheckUnavailable: false,
+    listOrder: settings.listOrder,
+    orderFallback: [],
   };
 
   let phase: CollectionPhase = 'profile';
@@ -383,6 +396,10 @@ export async function collect(options: CollectorOptions): Promise<CollectionResu
           `Instagram refused ${label} (${describeStatus(result.status)})${detail}. Open Instagram, sign in or finish any security check, then try again.`,
         );
       }
+      // An optional endpoint answering with Instagram's HTML app page is gone, not busy: don't retry.
+      if (optional && result.status === STATUS_SOFT_BLOCK && result.response?.bodyKind === 'html') {
+        return null;
+      }
       if (kind === 'throttled') {
         noteThrottled();
       }
@@ -419,13 +436,19 @@ export async function collect(options: CollectorOptions): Promise<CollectionResu
     }
   }
 
-  async function paginate(id: string, kind: ListKind, into: Map<string, IgUser>, expected: ExpectedSize | null) {
+  async function paginate(
+    id: string,
+    kind: ListKind,
+    into: Map<string, IgUser>,
+    expected: ExpectedSize | null,
+    order: ListOrder | null,
+  ) {
     const cap = kind === 'following' ? settings.followingPageCap : settings.followersPageCap;
     let maxId: string | null = null;
     let rankToken: string | null = null;
     for (let page = 0; ; ) {
       const result = (await request(`the ${kind} list`, () =>
-        fetchListPage(client, id, kind, { maxId, rankToken, count: settings.pageSize }),
+        fetchListPage(client, id, kind, { maxId, rankToken, count: settings.pageSize, order }),
       ))!;
       if (kind === 'following') {
         stats.followingPages++;
@@ -465,6 +488,26 @@ export async function collect(options: CollectorOptions): Promise<CollectionResu
         throw new CollectionStop('partial', `Stopped after ${cap} ${kind} pages, so the list is incomplete. Nothing was saved.`);
       }
       await pace();
+    }
+  }
+
+  /** Pages one list in the configured order, falling back to default paging if the sort is refused. */
+  async function collectList(id: string, kind: ListKind, into: Map<string, IgUser>, expected: ExpectedSize | null) {
+    const order = settings.listOrder;
+    if (!order) {
+      await paginate(id, kind, into, expected, null);
+      return;
+    }
+    try {
+      await paginate(id, kind, into, expected, order);
+    } catch (error) {
+      // Refused outright on the first page (not throttled, not signed out): try the default order.
+      if (error instanceof CollectionStop && error.outcome === 'error' && into.size === 0) {
+        stats.orderFallback.push(kind);
+        await paginate(id, kind, into, expected, null);
+        return;
+      }
+      throw error;
     }
   }
 
@@ -563,8 +606,8 @@ export async function collect(options: CollectorOptions): Promise<CollectionResu
     phase = 'lists';
     let firstError: unknown = null;
     const lists = [
-      paginate(viewerId, 'following', followingByPk, expected(reportedFollowing, baseline?.followingIds)),
-      paginate(viewerId, 'followers', followersByPk, expected(reportedFollowers, baseline?.followerIds)),
+      collectList(viewerId, 'following', followingByPk, expected(reportedFollowing, baseline?.followingIds)),
+      collectList(viewerId, 'followers', followersByPk, expected(reportedFollowers, baseline?.followerIds)),
     ];
     await Promise.all(
       lists.map(run =>
