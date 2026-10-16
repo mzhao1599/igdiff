@@ -37,6 +37,7 @@ export function makeResult(patch: Partial<CollectionResult> = {}): CollectionRes
       singleCheckUnavailable: false,
       listOrder: null,
       orderFallback: [],
+      resumedLists: [],
     },
     ...patch,
   };

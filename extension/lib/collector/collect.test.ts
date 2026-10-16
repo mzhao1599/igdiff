@@ -5,6 +5,7 @@ import {
   classifyFailure,
   collect,
   DEFAULT_COLLECTOR_SETTINGS,
+  type CheckpointDelta,
   type CollectionProgress,
   type CollectorOptions,
 } from './collect';
@@ -515,6 +516,88 @@ describe('collect: when profile counts are refused', () => {
     const { promise } = run({ intercept: noProfile });
     const result = await promise;
     expect(result.outcome).toBe('blocked');
+  });
+});
+
+describe('collect: checkpoints and resume', () => {
+  const user = (pk: string) => ({
+    pk,
+    ids: [pk],
+    username: `user${pk}`,
+    fullName: '',
+    profilePicUrl: '',
+    isPrivate: false,
+    isVerified: false,
+    followedBy: null,
+  });
+
+  it('reports a checkpoint after the profile and after every page', async () => {
+    const deltas: CheckpointDelta[] = [];
+    const { promise } = run(
+      { following: accounts('1', '2', '3'), followers: accounts('a', 'b'), followingChunk: 1, followersChunk: 1 },
+      { runId: 'run-1', onCheckpoint: delta => deltas.push(delta) },
+    );
+    await promise;
+    expect(deltas.every(delta => delta.runId === 'run-1')).toBe(true);
+    expect(deltas.filter(delta => delta.profile)).toHaveLength(1);
+    const following = deltas.filter(delta => delta.list?.kind === 'following').map(delta => delta.list!);
+    expect(following.map(list => list.users.map(u => u.pk))).toEqual([['1'], ['2'], ['3']]);
+    expect(following.map(list => list.done)).toEqual([false, false, true]);
+    expect(following.at(-1)?.maxId).toBeNull();
+    expect(deltas.at(-1)!.requests).toBeGreaterThan(deltas[0]!.requests);
+  });
+
+  it('resumes each list from its saved cursor without refetching what it has', async () => {
+    const { promise, fake } = run(
+      { following: accounts('1', '2', '3'), followers: accounts('a', 'b', 'c'), followersChunk: 1 },
+      {
+        resume: {
+          startedAt: 500,
+          profile: { reportedFollowers: 3, reportedFollowing: 3, viewerUsername: 'me', profileUnavailable: false },
+          following: { users: ['1', '2', '3'].map(user), maxId: null, rankToken: null, pages: 1, rows: 3, done: true, order: null },
+          followers: { users: [user('a')], maxId: '1', rankToken: null, pages: 1, rows: 1, done: false, order: null },
+        },
+      },
+    );
+    const result = await promise;
+    expect(result.outcome).toBe('completed');
+    expect(result.startedAt).toBe(500);
+    expect(sorted(result.followerIds)).toEqual(['a', 'b', 'c']);
+    expect(sorted(result.followingIds)).toEqual(['1', '2', '3']);
+    expect([...result.stats.resumedLists].sort()).toEqual(['followers', 'following']);
+    expect(fake.requests.some(r => r.path.endsWith('/info/'))).toBe(false);
+    expect(fake.requests.filter(r => r.path.endsWith('/following/'))).toHaveLength(0);
+    expect(fake.requests.filter(r => r.path.endsWith('/followers/')).map(r => r.params.get('max_id'))).toEqual(['1', '2']);
+  });
+
+  it('fails the run rather than mixing data when a saved cursor has gone stale', async () => {
+    const { promise } = run(
+      {
+        followers: accounts('a', 'b'),
+        intercept: r => (r.params.get('max_id') === 'stale' ? json({ message: 'Invalid max_id', status: 'fail' }, 400) : undefined),
+      },
+      {
+        resume: {
+          startedAt: 500,
+          profile: null,
+          following: null,
+          followers: { users: [user('a')], maxId: 'stale', rankToken: null, pages: 1, rows: 1, done: false, order: null },
+        },
+      },
+    );
+    const result = await promise;
+    expect(result.outcome).toBe('error');
+  });
+
+  it('stops at the request budget and says so', async () => {
+    const { promise, fake } = run(
+      { following: accounts('1', '2', '3', '4', '5'), followers: accounts('a'), followingChunk: 1 },
+      { maxRequests: 3 },
+    );
+    const result = await promise;
+    expect(result.outcome).toBe('budget');
+    expect(fake.requests).toHaveLength(3);
+    expect(result.message).toMatch(/budget/);
   });
 });
 

@@ -8,14 +8,27 @@
  *   - `events` keeps one row per follower gained/lost and follow added/removed.
  * Full id lists are only kept for the newest few snapshots (`snapshotLists`),
  * which is all the next diff needs.
+ *
+ * A sync in progress is checkpointed in `checkpoints` (cursor and counters per
+ * list) and `checkpointUsers` (accounts collected so far), so an interrupted
+ * run can continue instead of starting over. Checkpoints are never snapshots.
  */
 import { openDB, type DBSchema, type IDBPDatabase, type IDBPTransaction } from 'idb';
-import type { CollectionResult, CollectionStats, Verification } from '../collector/collect';
+import type {
+  CheckpointDelta,
+  CheckpointProfile,
+  CollectionResult,
+  CollectionStats,
+  ListProgress,
+  ResumeState,
+  Verification,
+} from '../collector/collect';
+import type { IgUser, ListKind } from '../instagram/api';
 import { DEFAULT_COMMIT_GUARD, planCommit, type CommitGuard, type RejectReason, type TrackerEventType } from './commit';
 import type { FollowSets } from './diff';
 
 export const DB_NAME = 'follower-tracker';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 /** Snapshots whose full id lists are kept. Older ones keep counts only. */
 export const KEEP_LISTS_FOR_SNAPSHOTS = 3;
 
@@ -101,6 +114,31 @@ export interface AccountExport {
   readonly profiles: readonly ProfileRecord[];
 }
 
+/** One sync in progress for one account. */
+export interface CheckpointRecord {
+  readonly viewerId: string;
+  readonly runId: string;
+  readonly startedAt: number;
+  readonly updatedAt: number;
+  /** Requests made across every run of this sync so far. */
+  readonly requests: number;
+  readonly profile: CheckpointProfile | null;
+  readonly following: ListProgress | null;
+  readonly followers: ListProgress | null;
+}
+
+export interface CheckpointUserRecord {
+  readonly viewerId: string;
+  readonly list: ListKind;
+  readonly pk: string;
+  readonly user: IgUser;
+}
+
+export interface LoadedCheckpoint {
+  readonly record: CheckpointRecord;
+  readonly resume: ResumeState;
+}
+
 type WithoutId<T extends { id: number }> = Omit<T, 'id'> & { id?: number };
 
 interface TrackerSchema extends DBSchema {
@@ -109,10 +147,17 @@ interface TrackerSchema extends DBSchema {
   snapshotLists: { key: number; value: SnapshotListsRecord; indexes: { byViewer: string } };
   profiles: { key: [string, string]; value: ProfileRecord; indexes: { byViewer: string } };
   events: { key: number; value: WithoutId<EventRecord>; indexes: { byViewer: [string, number] } };
+  checkpoints: { key: string; value: CheckpointRecord };
+  checkpointUsers: {
+    key: [string, string, string];
+    value: CheckpointUserRecord;
+    indexes: { byViewer: string; byList: [string, string] };
+  };
 }
 
 type StoreName = 'accounts' | 'snapshots' | 'snapshotLists' | 'profiles' | 'events';
 const ALL_STORES: StoreName[] = ['accounts', 'snapshots', 'snapshotLists', 'profiles', 'events'];
+const CHECKPOINT_STORES: Array<'checkpoints' | 'checkpointUsers'> = ['checkpoints', 'checkpointUsers'];
 
 function viewerTimeRange(viewerId: string): IDBKeyRange {
   return IDBKeyRange.bound([viewerId, -Infinity], [viewerId, Infinity]);
@@ -139,16 +184,24 @@ export class TrackerStore {
 
   static async open(name: string = DB_NAME): Promise<TrackerStore> {
     const db = await openDB<TrackerSchema>(name, DB_VERSION, {
-      upgrade(database) {
-        database.createObjectStore('accounts', { keyPath: 'viewerId' });
-        const snapshots = database.createObjectStore('snapshots', { keyPath: 'id', autoIncrement: true });
-        snapshots.createIndex('byViewer', ['viewerId', 'takenAt']);
-        const lists = database.createObjectStore('snapshotLists', { keyPath: 'snapshotId' });
-        lists.createIndex('byViewer', 'viewerId');
-        const profiles = database.createObjectStore('profiles', { keyPath: ['viewerId', 'pk'] });
-        profiles.createIndex('byViewer', 'viewerId');
-        const events = database.createObjectStore('events', { keyPath: 'id', autoIncrement: true });
-        events.createIndex('byViewer', ['viewerId', 'detectedAt']);
+      upgrade(database, oldVersion) {
+        if (oldVersion < 1) {
+          database.createObjectStore('accounts', { keyPath: 'viewerId' });
+          const snapshots = database.createObjectStore('snapshots', { keyPath: 'id', autoIncrement: true });
+          snapshots.createIndex('byViewer', ['viewerId', 'takenAt']);
+          const lists = database.createObjectStore('snapshotLists', { keyPath: 'snapshotId' });
+          lists.createIndex('byViewer', 'viewerId');
+          const profiles = database.createObjectStore('profiles', { keyPath: ['viewerId', 'pk'] });
+          profiles.createIndex('byViewer', 'viewerId');
+          const events = database.createObjectStore('events', { keyPath: 'id', autoIncrement: true });
+          events.createIndex('byViewer', ['viewerId', 'detectedAt']);
+        }
+        if (oldVersion < 2) {
+          database.createObjectStore('checkpoints', { keyPath: 'viewerId' });
+          const users = database.createObjectStore('checkpointUsers', { keyPath: ['viewerId', 'list', 'pk'] });
+          users.createIndex('byViewer', 'viewerId');
+          users.createIndex('byList', ['viewerId', 'list']);
+        }
       },
     });
     return new TrackerStore(db);
@@ -156,6 +209,10 @@ export class TrackerStore {
 
   close(): void {
     this.db.close();
+  }
+
+  async getAccount(viewerId: string): Promise<AccountRecord | null> {
+    return (await this.db.get('accounts', viewerId)) ?? null;
   }
 
   async listAccounts(): Promise<AccountRecord[]> {
@@ -333,7 +390,106 @@ export class TrackerStore {
     };
   }
 
+  /** Starts a fresh checkpoint for a new run, dropping whatever an older run left. */
+  async startCheckpoint(viewerId: string, runId: string, startedAt: number): Promise<void> {
+    const tx = this.db.transaction(CHECKPOINT_STORES, 'readwrite');
+    const users = tx.objectStore('checkpointUsers');
+    const stale = await users.index('byViewer').getAllKeys(viewerId);
+    await Promise.all([
+      ...stale.map(key => users.delete(key)),
+      tx.objectStore('checkpoints').put({
+        viewerId,
+        runId,
+        startedAt,
+        updatedAt: startedAt,
+        requests: 0,
+        profile: null,
+        following: null,
+        followers: null,
+      }),
+    ]);
+    await tx.done;
+  }
+
+  /**
+   * Records what a run reported. `runRequestsBefore` is how many requests the
+   * same run had reported earlier, so the total only grows by the difference.
+   * Deltas from a different run than the current checkpoint are ignored.
+   */
+  async applyCheckpointDelta(
+    viewerId: string,
+    delta: CheckpointDelta,
+    runRequestsBefore: number,
+    now: number,
+  ): Promise<boolean> {
+    const tx = this.db.transaction(CHECKPOINT_STORES, 'readwrite');
+    const header = await tx.objectStore('checkpoints').get(viewerId);
+    if (!header || header.runId !== delta.runId) {
+      await tx.done;
+      return false;
+    }
+    const writes: Array<Promise<unknown>> = [];
+    let next: CheckpointRecord = {
+      ...header,
+      updatedAt: now,
+      requests: header.requests + Math.max(0, delta.requests - runRequestsBefore),
+      ...(delta.profile ? { profile: delta.profile } : {}),
+    };
+    if (delta.list) {
+      const { kind, users, ...progress } = delta.list;
+      next = { ...next, [kind]: progress };
+      const store = tx.objectStore('checkpointUsers');
+      for (const user of users) {
+        writes.push(store.put({ viewerId, list: kind, pk: user.pk, user }));
+      }
+    }
+    writes.push(tx.objectStore('checkpoints').put(next));
+    await Promise.all(writes);
+    await tx.done;
+    return true;
+  }
+
+  async getCheckpoint(viewerId: string): Promise<CheckpointRecord | null> {
+    return (await this.db.get('checkpoints', viewerId)) ?? null;
+  }
+
+  /** The checkpoint plus everything collected so far, ready to hand to the collector. */
+  async loadCheckpoint(viewerId: string): Promise<LoadedCheckpoint | null> {
+    const tx = this.db.transaction(CHECKPOINT_STORES, 'readonly');
+    const record = await tx.objectStore('checkpoints').get(viewerId);
+    if (!record) {
+      await tx.done;
+      return null;
+    }
+    const byList = tx.objectStore('checkpointUsers').index('byList');
+    const [following, followers] = await Promise.all([
+      byList.getAll([viewerId, 'following']),
+      byList.getAll([viewerId, 'followers']),
+    ]);
+    await tx.done;
+    const withUsers = (progress: ListProgress | null, rows: CheckpointUserRecord[]) =>
+      progress ? { ...progress, users: rows.map(row => row.user) } : null;
+    return {
+      record,
+      resume: {
+        startedAt: record.startedAt,
+        profile: record.profile,
+        following: withUsers(record.following, following),
+        followers: withUsers(record.followers, followers),
+      },
+    };
+  }
+
+  async clearCheckpoint(viewerId: string): Promise<void> {
+    const tx = this.db.transaction(CHECKPOINT_STORES, 'readwrite');
+    const users = tx.objectStore('checkpointUsers');
+    const keys = await users.index('byViewer').getAllKeys(viewerId);
+    await Promise.all([...keys.map(key => users.delete(key)), tx.objectStore('checkpoints').delete(viewerId)]);
+    await tx.done;
+  }
+
   async deleteAccount(viewerId: string): Promise<void> {
+    await this.clearCheckpoint(viewerId);
     const tx = this.db.transaction(ALL_STORES, 'readwrite');
     const deletes: Array<Promise<unknown>> = [tx.objectStore('accounts').delete(viewerId)];
     for (const name of ['snapshots', 'events'] as const) {

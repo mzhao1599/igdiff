@@ -17,9 +17,14 @@
  * reported. Those checks are best effort: if Instagram refuses them, the sync
  * still completes and the changes are recorded as `unconfirmed`.
  *
+ * Resumable: after every page the collector reports a checkpoint (the page's
+ * accounts plus the next cursor). Given those back as `resume`, a later run
+ * continues each list from its cursor instead of starting over.
+ *
  * Fail-closed: only `outcome === 'completed'` results may be saved. Throttling
- * on the lists themselves, a sign-in or challenge page, a page cap, a stop, or
- * an empty list where data was expected yields a different outcome.
+ * on the lists themselves, a sign-in or challenge page, a page cap, a stop, the
+ * request budget, or an empty list where data was expected yields a different
+ * outcome.
  */
 import {
   fetchFriendshipStatus,
@@ -45,7 +50,9 @@ export type CollectionOutcome =
   | 'blocked'
   | 'error'
   | 'no_session'
-  | 'stopped';
+  | 'stopped'
+  /** Hit `maxRequests` (the daily request budget). The checkpoint lets a later run continue. */
+  | 'budget';
 
 export type Verification = 'confirmed' | 'unconfirmed';
 
@@ -106,6 +113,43 @@ export interface Baseline {
   readonly followingIds: readonly string[];
 }
 
+/** Profile facts carried across an interrupted run. */
+export interface CheckpointProfile {
+  readonly reportedFollowers: number | null;
+  readonly reportedFollowing: number | null;
+  readonly viewerUsername: string | null;
+  readonly profileUnavailable: boolean;
+}
+
+/** Where paging of one list stands. */
+export interface ListProgress {
+  /** Cursor for the next page; null once the list is done. */
+  readonly maxId: string | null;
+  readonly rankToken: string | null;
+  readonly pages: number;
+  readonly rows: number;
+  readonly done: boolean;
+  readonly order: ListOrder | null;
+}
+
+/** Reported after the profile step and after every page. Carries only what is new. */
+export interface CheckpointDelta {
+  readonly runId: string;
+  readonly startedAt: number;
+  /** Requests this run has made so far (not counting earlier, interrupted runs). */
+  readonly requests: number;
+  readonly profile?: CheckpointProfile;
+  readonly list?: ListProgress & { readonly kind: ListKind; readonly users: readonly IgUser[] };
+}
+
+/** Everything saved from earlier, interrupted runs of the same sync. */
+export interface ResumeState {
+  readonly startedAt: number;
+  readonly profile: CheckpointProfile | null;
+  readonly following: (ListProgress & { readonly users: readonly IgUser[] }) | null;
+  readonly followers: (ListProgress & { readonly users: readonly IgUser[] }) | null;
+}
+
 export type CollectionPhase = 'profile' | 'lists' | 'verifying' | 'done';
 
 export interface CollectionProgress {
@@ -161,6 +205,8 @@ export interface CollectionStats {
   listOrder: ListOrder | null;
   /** Lists whose sorted request was refused and that were paged in default order instead. */
   orderFallback: ListKind[];
+  /** Lists continued from an interrupted run's checkpoint. */
+  resumedLists: ListKind[];
 }
 
 export interface CollectionResult {
@@ -186,6 +232,13 @@ export interface CollectorOptions {
   readonly viewerId: string | null;
   readonly baseline?: Baseline | null;
   readonly settings?: Partial<CollectorSettings>;
+  /** Identifies this sync across interruptions; echoed in every checkpoint. */
+  readonly runId?: string;
+  /** Continue an interrupted run instead of starting over. */
+  readonly resume?: ResumeState | null;
+  /** Hard cap on requests for this run (the remaining daily budget). */
+  readonly maxRequests?: number;
+  readonly onCheckpoint?: (delta: CheckpointDelta) => void;
   readonly signal?: AbortSignal;
   readonly onProgress?: (progress: CollectionProgress) => void;
   readonly sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
@@ -289,6 +342,8 @@ export async function collect(options: CollectorOptions): Promise<CollectionResu
   const now = options.now ?? Date.now;
   const viewerId = options.viewerId;
   const baseline = options.baseline ?? null;
+  const runId = options.runId ?? 'local';
+  const resume = options.resume ?? null;
 
   // Aborted by the caller (Stop) or internally when one list fails and the other must stop too.
   const internal = new AbortController();
@@ -298,7 +353,7 @@ export async function collect(options: CollectorOptions): Promise<CollectionResu
     internal.abort();
   }
 
-  const startedAt = now();
+  const startedAt = resume?.startedAt ?? now();
   const followingByPk = new Map<string, IgUser>();
   const followersByPk = new Map<string, IgUser>();
   const followerIds = new Set<string>();
@@ -326,6 +381,7 @@ export async function collect(options: CollectorOptions): Promise<CollectionResu
     singleCheckUnavailable: false,
     listOrder: settings.listOrder,
     orderFallback: [],
+    resumedLists: [],
   };
 
   let phase: CollectionPhase = 'profile';
@@ -360,6 +416,21 @@ export async function collect(options: CollectorOptions): Promise<CollectionResu
     }
   };
 
+  /** Call before every request: stop, rather than go over the request budget. */
+  const checkBudget = () => {
+    checkStopped();
+    if (options.maxRequests !== undefined && stats.requests >= options.maxRequests) {
+      throw new CollectionStop(
+        'budget',
+        `Reached today's request budget after ${stats.requests} requests. Progress is kept and the sync continues later.`,
+      );
+    }
+  };
+
+  const checkpoint = (delta: Omit<CheckpointDelta, 'runId' | 'startedAt' | 'requests'>) => {
+    options.onCheckpoint?.({ runId, startedAt, requests: stats.requests, ...delta });
+  };
+
   const wait = async (reason: 'pacing' | 'cooldown' | 'backoff', ms: number, attempt = 0) => {
     if (ms <= 0) {
       checkStopped();
@@ -380,7 +451,7 @@ export async function collect(options: CollectorOptions): Promise<CollectionResu
    */
   async function request<T>(label: string, attemptOnce: () => Promise<ApiResult<T>>, optional = false): Promise<T | null> {
     for (let attempt = 0; ; ) {
-      checkStopped();
+      checkBudget();
       const result = await attemptOnce();
       stats.requests++;
       lastStatus = result.status;
@@ -442,11 +513,12 @@ export async function collect(options: CollectorOptions): Promise<CollectionResu
     into: Map<string, IgUser>,
     expected: ExpectedSize | null,
     order: ListOrder | null,
+    start: { readonly maxId: string; readonly rankToken: string | null; readonly page: number } | null = null,
   ) {
     const cap = kind === 'following' ? settings.followingPageCap : settings.followersPageCap;
-    let maxId: string | null = null;
-    let rankToken: string | null = null;
-    for (let page = 0; ; ) {
+    let maxId: string | null = start?.maxId ?? null;
+    let rankToken: string | null = start?.rankToken ?? null;
+    for (let page = start?.page ?? 0; ; ) {
       const result = (await request(`the ${kind} list`, () =>
         fetchListPage(client, id, kind, { maxId, rankToken, count: settings.pageSize, order }),
       ))!;
@@ -459,7 +531,7 @@ export async function collect(options: CollectorOptions): Promise<CollectionResu
         stats.followerRows += result.users.length;
       }
 
-      if (page === 0 && result.users.length === 0 && expected !== null && expected.count > 0) {
+      if (!start && page === 0 && result.users.length === 0 && expected !== null && expected.count > 0) {
         // Issue #5 in the legacy repo: 200 OK, real count elsewhere, zero rows here.
         throw new CollectionStop(
           'blocked',
@@ -475,11 +547,24 @@ export async function collect(options: CollectorOptions): Promise<CollectionResu
       rankToken = result.rankToken ?? rankToken;
       emit();
 
-      if (!result.nextMaxId) {
-        return;
-      }
-      if (result.nextMaxId === maxId) {
+      const repeated = result.nextMaxId !== null && result.nextMaxId === maxId;
+      const done = !result.nextMaxId || repeated;
+      checkpoint({
+        list: {
+          kind,
+          users: result.users,
+          maxId: done ? null : result.nextMaxId,
+          rankToken,
+          pages: kind === 'following' ? stats.followingPages : stats.followersPages,
+          rows: kind === 'following' ? stats.followingRows : stats.followerRows,
+          done,
+          order,
+        },
+      });
+      if (repeated) {
         stats.cursorRepeated = true;
+      }
+      if (done) {
         return;
       }
       maxId = result.nextMaxId;
@@ -493,6 +578,26 @@ export async function collect(options: CollectorOptions): Promise<CollectionResu
 
   /** Pages one list in the configured order, falling back to default paging if the sort is refused. */
   async function collectList(id: string, kind: ListKind, into: Map<string, IgUser>, expected: ExpectedSize | null) {
+    const saved = resume?.[kind] ?? null;
+    if (saved && (saved.done || saved.maxId)) {
+      stats.resumedLists.push(kind);
+      for (const user of saved.users) {
+        into.set(user.pk, user);
+      }
+      if (kind === 'following') {
+        stats.followingPages = saved.pages;
+        stats.followingRows = saved.rows;
+      } else {
+        stats.followersPages = saved.pages;
+        stats.followerRows = saved.rows;
+      }
+      if (saved.done || !saved.maxId) {
+        return;
+      }
+      // A stale cursor fails as an error and the whole run is discarded; the next one starts fresh.
+      await paginate(id, kind, into, null, saved.order, { maxId: saved.maxId, rankToken: saved.rankToken, page: saved.pages });
+      return;
+    }
     const order = settings.listOrder;
     if (!order) {
       await paginate(id, kind, into, expected, null);
@@ -537,7 +642,7 @@ export async function collect(options: CollectorOptions): Promise<CollectionResu
       stats.singleCheckUnavailable = true;
     }
     for (const [index, id] of batch.entries()) {
-      checkStopped();
+      checkBudget();
       const result = await fetchFriendshipStatus(client, id);
       stats.requests++;
       lastStatus = result.status;
@@ -580,20 +685,29 @@ export async function collect(options: CollectorOptions): Promise<CollectionResu
 
     // Counts are best-effort: they guard against "200 OK but empty" lists and drive progress.
     emit();
-    const profile = await fetchProfile(client, viewerId);
-    stats.requests++;
-    lastStatus = profile.status;
-    if (profile.data) {
-      reportedFollowers = profile.data.followerCount;
-      reportedFollowing = profile.data.followingCount;
-      viewerUsername = profile.data.username;
-    } else if (classifyFailure(profile.status, profile.failure) === 'auth') {
-      throw new CollectionStop(
-        'blocked',
-        `Instagram refused the profile request (${describeStatus(profile.status)}). Sign in again or finish any security check.`,
-      );
+    if (resume?.profile) {
+      ({ reportedFollowers, reportedFollowing, viewerUsername } = resume.profile);
+      stats.profileUnavailable = resume.profile.profileUnavailable;
     } else {
-      stats.profileUnavailable = true;
+      checkBudget();
+      const profile = await fetchProfile(client, viewerId);
+      stats.requests++;
+      lastStatus = profile.status;
+      if (profile.data) {
+        reportedFollowers = profile.data.followerCount;
+        reportedFollowing = profile.data.followingCount;
+        viewerUsername = profile.data.username;
+      } else if (classifyFailure(profile.status, profile.failure) === 'auth') {
+        throw new CollectionStop(
+          'blocked',
+          `Instagram refused the profile request (${describeStatus(profile.status)}). Sign in again or finish any security check.`,
+        );
+      } else {
+        stats.profileUnavailable = true;
+      }
+      checkpoint({
+        profile: { reportedFollowers, reportedFollowing, viewerUsername, profileUnavailable: stats.profileUnavailable },
+      });
     }
 
     const expected = (reported: number | null, previous: readonly string[] | undefined): ExpectedSize | null => {

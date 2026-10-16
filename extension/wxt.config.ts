@@ -28,8 +28,9 @@ export default defineConfig({
     name: mode === 'production' ? 'Follower Tracker' : 'Follower Tracker (dev)',
     description:
       'See who does not follow you back, your mutuals, and who unfollowed you. Runs locally in your browser.',
-    // unlimitedStorage keeps snapshot history from being evicted under disk pressure.
-    permissions: ['unlimitedStorage'],
+    // unlimitedStorage keeps snapshot history from being evicted under disk pressure;
+    // storage holds scheduler state; alarms re-checks long-lived Instagram tabs.
+    permissions: ['unlimitedStorage', 'storage', 'alarms'],
     host_permissions: ['https://www.instagram.com/*'],
     action: {
       default_title: 'Follower Tracker',

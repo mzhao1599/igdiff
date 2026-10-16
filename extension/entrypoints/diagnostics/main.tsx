@@ -11,6 +11,7 @@ import {
   type EnvProblem,
   type EnvStatus,
   type ProbeResponse,
+  type SchedulerStatus,
   type SyncStartResponse,
   type SyncStopResponse,
 } from '../../lib/messages';
@@ -26,11 +27,12 @@ import {
 } from '../../lib/tracker/store';
 import './style.css';
 
-const PROBLEM_HINTS: Record<EnvProblem | 'already_running', string> = {
+const PROBLEM_HINTS: Record<EnvProblem | 'already_running' | 'budget', string> = {
   no_instagram_tab: 'Open https://www.instagram.com in a tab and sign in.',
   content_script_missing: 'Reload the Instagram tab. It was open before this build of the extension loaded.',
   signed_out: 'Sign in to Instagram in that tab, then refresh this page.',
   already_running: 'A sync is already running in the Instagram tab.',
+  budget: "Today's request budget is used up. Syncing continues tomorrow.",
 };
 
 const EVENT_LABELS: Record<EventRecord['type'], string> = {
@@ -379,6 +381,102 @@ interface AccountView {
   readonly profiles: ReadonlyMap<string, ProfileRecord>;
 }
 
+function describeNext(status: SchedulerStatus): string {
+  const next = status.next;
+  if (!next) {
+    return 'Sign in to Instagram in a tab to see the schedule.';
+  }
+  if (next.action !== 'wait') {
+    return next.action === 'start'
+      ? 'Due now: starts the next time an Instagram tab finishes loading (or within 30 minutes).'
+      : 'An interrupted sync will resume the next time an Instagram tab is open.';
+  }
+  const until = next.until ? formatTime(next.until) : null;
+  switch (next.reason) {
+    case 'disabled':
+      return 'Off. Turn it on to sync once a day while Instagram is open.';
+    case 'running':
+      return 'A sync is running now.';
+    case 'fresh':
+      return `Next sync after ${until} (one per day).`;
+    case 'backoff':
+      return `Waiting after the last attempt failed. Next try after ${until}.`;
+    case 'budget':
+      return `Today's request budget does not cover another sync. Next try after ${until}.`;
+    default:
+      return next.reason;
+  }
+}
+
+function AutoSyncSection({ refreshKey }: { refreshKey: number }) {
+  const [status, setStatus] = useState<SchedulerStatus | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+
+  const load = useCallback(() => {
+    void sendToBackground<SchedulerStatus>({ type: 'scheduler:status' }).then(setStatus);
+  }, []);
+  useEffect(load, [load, refreshKey]);
+
+  const toggle = async (enabled: boolean) => {
+    await sendToBackground({ type: 'scheduler:set', enabled });
+    load();
+  };
+
+  const trigger = async () => {
+    const response = await sendToBackground<{ started: boolean; reason?: string }>({ type: 'scheduler:trigger' });
+    setNote(response.started ? 'Started.' : `Not started: ${response.reason ?? 'unknown reason'}.`);
+    load();
+  };
+
+  return (
+    <section>
+      <h2>Automatic sync {status && <Badge value={status.enabled ? 'ok' : 'off'} />}</h2>
+      {status ? (
+        <>
+          <label class='row'>
+            <input type='checkbox' checked={status.enabled} onChange={e => void toggle((e.currentTarget as HTMLInputElement).checked)} />
+            Sync automatically once a day while an Instagram tab is open
+          </label>
+          <p class='hint'>{describeNext(status)}</p>
+          <dl class='facts'>
+            <dt>Running</dt>
+            <dd>
+              {status.running
+                ? `${status.running.mode === 'auto' ? 'automatic' : 'manual'} sync since ${formatTime(status.running.startedAt)}`
+                : 'nothing'}
+            </dd>
+            <dt>Last saved sync</dt>
+            <dd>{status.lastSyncAt ? formatTime(status.lastSyncAt) : 'never'}</dd>
+            <dt>Last attempt</dt>
+            <dd>{status.lastAttempt ? `${status.lastAttempt.outcome} at ${formatTime(status.lastAttempt.at)}` : '—'}</dd>
+            <dt>Requests today</dt>
+            <dd>
+              {status.budgetUsed} of {status.dailyBudget} (a sync takes about {status.estimate})
+            </dd>
+            {status.checkpoint && (
+              <>
+                <dt>Interrupted sync</dt>
+                <dd>
+                  following {status.checkpoint.following?.rows ?? 0}
+                  {status.checkpoint.following?.done ? ' (done)' : ''}, followers {status.checkpoint.followers?.rows ?? 0}
+                  {status.checkpoint.followers?.done ? ' (done)' : ''}, saved {formatTime(status.checkpoint.updatedAt)}
+                </dd>
+              </>
+            )}
+          </dl>
+          <div class='row' style={{ marginTop: '12px' }}>
+            <button onClick={() => void trigger()}>Run the automatic check now</button>
+            <span class='muted'>Skips the one-day wait; still one sync at a time and within the budget.</span>
+          </div>
+          {note && <p class='hint'>{note}</p>}
+        </>
+      ) : (
+        <p class='muted'>Loading…</p>
+      )}
+    </section>
+  );
+}
+
 const LIST_LIMIT = 300;
 
 async function loadAccountView(store: TrackerStore, viewerId: string): Promise<AccountView> {
@@ -643,6 +741,8 @@ function App() {
         setProgress(null);
         setStopping(false);
         setNote(null);
+      } else if (msg.type === 'scheduler:changed') {
+        setRefreshKey(n => n + 1);
       } else if (msg.type === 'sync:committed') {
         setCommit(msg.outcome);
         setRefreshKey(n => n + 1);
@@ -733,6 +833,7 @@ function App() {
       </header>
       <EnvSection env={env} onRefresh={() => void refreshEnv()} />
       <ProbeSection ready={ready} />
+      <AutoSyncSection refreshKey={refreshKey} />
       <SyncSection
         ready={ready}
         running={running}
