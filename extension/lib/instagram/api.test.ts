@@ -3,6 +3,8 @@ import { createFakeInstagram, html, json } from '../testing/fake-instagram';
 import {
   clampPageSize,
   collectRawUserIds,
+  describeListShape,
+  fetchFriendshipStatus,
   fetchFriendshipStatuses,
   fetchListPage,
   fetchProfile,
@@ -10,6 +12,7 @@ import {
   parseFollowedBy,
   parseNextMaxId,
   parseRankToken,
+  parseResponseBody,
   STATUS_NETWORK_ERROR,
   STATUS_SOFT_BLOCK,
   type InstagramClient,
@@ -110,9 +113,9 @@ describe('parseRankToken', () => {
 });
 
 describe('clampPageSize', () => {
-  it('keeps the requested size inside 10-100 and defaults to 50', () => {
+  it('keeps the requested size inside 10-200 and defaults to 50', () => {
     expect(clampPageSize(80)).toBe(80);
-    expect(clampPageSize(500)).toBe(100);
+    expect(clampPageSize(500)).toBe(200);
     expect(clampPageSize(1)).toBe(10);
     expect(clampPageSize(undefined)).toBe(50);
     expect(clampPageSize(Number.NaN)).toBe(50);
@@ -133,7 +136,7 @@ describe('fetchListPage', () => {
     };
     await fetchListPage(client, '1000', 'following', { count: 500, maxId: '50', rankToken: 'tok' });
     const params = fake.requests[0]!.params;
-    expect(params.get('count')).toBe('100');
+    expect(params.get('count')).toBe('200');
     expect(params.get('max_id')).toBe('50');
     expect(params.get('rank_token')).toBe('tok');
     expect(params.get('search_surface')).toBe('follow_list_page');
@@ -212,5 +215,84 @@ describe('fetchFriendshipStatuses', () => {
     expect(result.data?.get('1')).toEqual({ following: false, followedBy: true });
     expect(result.data?.get('2')).toEqual({ following: true, followedBy: false });
     expect(result.data?.has('3')).toBe(false);
+  });
+});
+
+describe('parseResponseBody', () => {
+  it('strips the for (;;); prefix Meta puts in front of some JSON', () => {
+    const { body, info } = parseResponseBody('for (;;);{"status":"ok"}', 'application/json');
+    expect(body).toEqual({ status: 'ok' });
+    expect(info.bodyKind).toBe('json-prefixed');
+  });
+
+  it('labels HTML, empty and other bodies without keeping them', () => {
+    expect(parseResponseBody('<!doctype html><html></html>', 'text/html').info).toEqual({
+      contentType: 'text/html',
+      bodyKind: 'html',
+      bytes: 28,
+    });
+    expect(parseResponseBody('', null).info.bodyKind).toBe('empty');
+    expect(parseResponseBody('oops', 'text/plain').info.bodyKind).toBe('text');
+  });
+});
+
+describe('describeListShape cursor', () => {
+  it('recognizes offset, opaque and object cursors', () => {
+    expect(describeListShape({ users: [{}, {}], next_max_id: '2' })).toMatchObject({
+      cursorKind: 'numeric',
+      cursorLooksLikeOffset: true,
+    });
+    expect(describeListShape({ users: [{}], next_max_id: 'QVFBc2' }).cursorKind).toBe('opaque');
+    expect(describeListShape({ users: [], next_max_id: { a: 1 } }).cursorKind).toBe('json');
+    expect(describeListShape({ users: [] }).cursorKind).toBeNull();
+  });
+});
+
+describe('fetchFriendshipStatus', () => {
+  it('reads top-level flags', async () => {
+    const fake = createFakeInstagram({ followers: [{ pk: '7' }] });
+    const result = await fetchFriendshipStatus(fake.client, '7');
+    expect(fake.requests[0]!.path).toBe('/api/v1/friendships/show/7/');
+    expect(result.data).toEqual({ following: false, followedBy: true });
+  });
+
+  it('reads nested friendship_status too', async () => {
+    const fake = createFakeInstagram({
+      intercept: () => json({ friendship_status: { following: true, followed_by: false }, status: 'ok' }),
+    });
+    const result = await fetchFriendshipStatus(fake.client, '7');
+    expect(result.data).toEqual({ following: true, followedBy: false });
+  });
+
+  it('returns no data for an account Instagram does not know', async () => {
+    const fake = createFakeInstagram({ friendships: { '9': null } });
+    const result = await fetchFriendshipStatus(fake.client, '9');
+    expect(result.status).toBe(404);
+    expect(result.data).toBeNull();
+  });
+});
+
+describe('fetchListPage options', () => {
+  it('can drop search_surface and ask for a sort order', async () => {
+    const fake = createFakeInstagram({ following: [{ pk: '1' }] });
+    await fetchListPage(fake.client, '1000', 'following', { searchSurface: false, order: 'date_followed_latest' });
+    const params = fake.requests[0]!.params;
+    expect(params.has('search_surface')).toBe(false);
+    expect(params.get('order')).toBe('date_followed_latest');
+  });
+});
+
+describe('describeListShape list flags', () => {
+  it('reads the hidden count, page_size and limit flags', () => {
+    expect(
+      describeListShape({
+        users: [],
+        hidden_following_account_count: 6,
+        page_size: 50,
+        should_limit_list_of_followers: false,
+        should_limit_list_of_followings: true,
+      }),
+    ).toMatchObject({ hiddenCount: 6, pageSizeField: 50, shouldLimitFollowers: false, shouldLimitFollowings: true });
+    expect(describeListShape({ users: [] })).toMatchObject({ hiddenCount: null, pageSizeField: null });
   });
 });

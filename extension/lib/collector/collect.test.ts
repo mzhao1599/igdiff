@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { accounts, createFakeInstagram, html, json, type FakeInstagramOptions } from '../testing/fake-instagram';
-import { backoffMs, classifyFailure, collect, type CollectionProgress, type CollectorOptions } from './collect';
+import {
+  backoffMs,
+  classifyFailure,
+  collect,
+  DEFAULT_COLLECTOR_SETTINGS,
+  type CollectionProgress,
+  type CollectorOptions,
+} from './collect';
 
 function run(fakeOptions: FakeInstagramOptions, overrides: Partial<CollectorOptions> = {}) {
   const fake = createFakeInstagram(fakeOptions);
@@ -52,10 +59,17 @@ describe('collect: happy path', () => {
     expect(result.stats.sweepChecked).toBe(1);
   });
 
-  it('keeps one row when Instagram repeats an account on a later page', async () => {
+  it('keeps one row when Instagram repeats an account on a later page, and counts the repeat', async () => {
     const { promise } = run({ following: [{ pk: '1' }, { pk: '2' }, { pk: '2' }, { pk: '3' }], followingChunk: 2 });
     const result = await promise;
     expect(sorted(result.followingIds)).toEqual(['1', '2', '3']);
+    expect(result.stats.followingRows).toBe(4);
+  });
+
+  it('records how many accounts Instagram hides from the following list', async () => {
+    const { promise } = run({ following: accounts('1'), followers: accounts('1'), hiddenFollowing: 6 });
+    const result = await promise;
+    expect(result.stats.hiddenFollowing).toBe(6);
   });
 
   it('handles an account that follows nobody and has no followers', async () => {
@@ -73,7 +87,7 @@ describe('collect: happy path', () => {
     );
     await promise;
     expect(sleeps.filter(ms => ms === 9_000)).toHaveLength(1);
-    expect(sleeps.filter(ms => ms === 100).length).toBeGreaterThanOrEqual(7);
+    expect(sleeps.filter(ms => ms === 100)).toHaveLength(6);
   });
 });
 
@@ -162,17 +176,19 @@ describe('collect: failures', () => {
     const result = await promise;
     expect(result.outcome).toBe('completed');
     expect(result.stats.retries).toBe(1);
-    expect(sleeps).toContain(backoffMs(1, 120_000, 600_000, () => 0.5));
+    const { throttleBackoffMs, backoffMaxMs } = DEFAULT_COLLECTOR_SETTINGS;
+    expect(sleeps).toContain(backoffMs(1, throttleBackoffMs, backoffMaxMs, () => 0.5));
   });
 
   it('gives up as rate_limited after maxRetries consecutive 429s', async () => {
-    const { promise } = run(
+    const { promise, fake } = run(
       { following: accounts('1'), intercept: r => (r.path.endsWith('/following/') ? json({}, 429) : undefined) },
       { settings: { maxRetries: 2 } },
     );
     const result = await promise;
     expect(result.outcome).toBe('rate_limited');
-    expect(result.stats.retries).toBe(3);
+    expect(result.stats.retries).toBe(2);
+    expect(fake.requests.filter(r => r.path.endsWith('/following/'))).toHaveLength(3);
   });
 
   it('treats a 200 HTML challenge page like throttling', async () => {
@@ -227,21 +243,7 @@ describe('collect: failures', () => {
       random: () => 0,
     });
     expect(result.outcome).toBe('completed');
-    expect(sleeps).toContain(5_000);
-  });
-
-  it('fails the whole sync when the friendship check stays rate limited', async () => {
-    const { promise } = run(
-      {
-        following: accounts('1'),
-        followers: [],
-        reportedFollowers: 0,
-        intercept: r => (r.path.endsWith('/show_many/') ? json({}, 429) : undefined),
-      },
-      { settings: { maxRetries: 1 } },
-    );
-    const result = await promise;
-    expect(result.outcome).toBe('rate_limited');
+    expect(sleeps).toContain(DEFAULT_COLLECTOR_SETTINGS.transientBackoffMs);
   });
 
   it('returns no_session without any request when nobody is signed in', async () => {
@@ -328,12 +330,149 @@ describe('collect: verifying changes against the previous snapshot', () => {
   });
 });
 
+describe('collect: speed', () => {
+  it('fetches both lists side by side', async () => {
+    const { promise, fake } = run({ following: accounts('1', '2'), followers: accounts('3', '4'), followingChunk: 1, followersChunk: 1 });
+    await promise;
+    const lists = fake.requests.map(r => r.path.split('/').filter(Boolean).pop()).filter(p => p === 'following' || p === 'followers');
+    expect(lists.slice(0, 2).sort()).toEqual(['followers', 'following']);
+  });
+
+  it('adds no fixed delay between pages by default, only jitter', async () => {
+    const { promise, sleeps } = run({ following: accounts('1', '2', '3'), followingChunk: 1 });
+    await promise;
+    expect(sleeps.every(ms => ms < DEFAULT_COLLECTOR_SETTINGS.pageJitterMs)).toBe(true);
+  });
+
+  it('slows every later page down once Instagram throttles', async () => {
+    const { promise, sleeps } = run(
+      {
+        following: accounts('1', '2', '3'),
+        followingChunk: 1,
+        intercept: r => (r.path.endsWith('/following/') && r.nth === 1 ? json({}, 429) : undefined),
+      },
+      { random: () => 0 },
+    );
+    const result = await promise;
+    expect(result.outcome).toBe('completed');
+    expect(sleeps.filter(ms => ms === DEFAULT_COLLECTOR_SETTINGS.slowdownAfterThrottleMs).length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('stops the other list when one list fails', async () => {
+    const { promise, fake } = run({
+      following: accounts('1', '2', '3', '4', '5'),
+      followingChunk: 1,
+      intercept: r => (r.path.endsWith('/followers/') ? json({ status: 'fail' }, 404) : undefined),
+    });
+    const result = await promise;
+    expect(result.outcome).toBe('error');
+    expect(result.message).toMatch(/followers/);
+    expect(fake.requests.filter(r => r.path.endsWith('/following/')).length).toBeLessThan(5);
+  });
+});
+
+describe('collect: when friendship checks are refused', () => {
+  const htmlEverywhere = (path: string) => (r: { path: string }) => (r.path.endsWith(path) ? html('<html/>') : undefined);
+
+  it('retries the bulk check once, quickly, then completes without it', async () => {
+    const { promise, fake, sleeps } = run({
+      following: accounts('1', '2'),
+      followers: accounts('2'),
+      intercept: htmlEverywhere('/show_many/'),
+    });
+    const result = await promise;
+    expect(result.outcome).toBe('completed');
+    expect(result.stats.bulkCheckUnavailable).toBe(true);
+    expect(fake.requests.filter(r => r.path.endsWith('/show_many/'))).toHaveLength(2);
+    expect(sleeps.every(ms => ms < DEFAULT_COLLECTOR_SETTINGS.throttleBackoffMs)).toBe(true);
+    expect(sorted(result.followerIds)).toEqual(['2']);
+  });
+
+  it('falls back to one-by-one checks for apparent changes', async () => {
+    const { promise, fake } = run(
+      {
+        following: [],
+        followers: accounts('1'),
+        friendships: {
+          '2': { following: false, followed_by: true },
+          '3': { following: false, followed_by: false },
+          '4': null,
+        },
+        intercept: htmlEverywhere('/show_many/'),
+      },
+      { baseline: { followerIds: ['1', '2', '3', '4'], followingIds: [] } },
+    );
+    const result = await promise;
+    expect(result.outcome).toBe('completed');
+    expect(sorted(result.followerIds)).toEqual(['1', '2']);
+    expect(result.lostFollowerChecks).toEqual({ '3': 'confirmed', '4': 'unconfirmed' });
+    expect(result.stats.singleChecks).toBe(2);
+    expect(fake.requests.filter(r => r.path.startsWith('/api/v1/friendships/show/'))).toHaveLength(3);
+  });
+
+  it('caps one-by-one checks and leaves the rest unconfirmed', async () => {
+    const { promise } = run(
+      { followers: [], reportedFollowers: 0, friendships: {}, intercept: htmlEverywhere('/show_many/') },
+      { baseline: { followerIds: ['1', '2', '3'], followingIds: [] }, settings: { singleCheckLimit: 2 } },
+    );
+    const result = await promise;
+    expect(result.outcome).toBe('completed');
+    expect(result.stats.singleChecks).toBe(2);
+    expect(result.stats.singleCheckUnavailable).toBe(true);
+    expect(Object.values(result.lostFollowerChecks).filter(v => v === 'unconfirmed')).toHaveLength(1);
+  });
+
+  it('stops one-by-one checks as soon as Instagram throttles them', async () => {
+    const { promise, fake } = run(
+      {
+        followers: [],
+        reportedFollowers: 0,
+        intercept: r =>
+          r.path.endsWith('/show_many/') ? html('<html/>') : r.path.startsWith('/api/v1/friendships/show/') ? json({}, 429) : undefined,
+      },
+      { baseline: { followerIds: ['1', '2', '3'], followingIds: [] } },
+    );
+    const result = await promise;
+    expect(result.outcome).toBe('completed');
+    expect(fake.requests.filter(r => r.path.startsWith('/api/v1/friendships/show/'))).toHaveLength(1);
+    expect(result.lostFollowerChecks).toEqual({ '1': 'unconfirmed', '2': 'unconfirmed', '3': 'unconfirmed' });
+  });
+});
+
+describe('collect: when profile counts are refused', () => {
+  const noProfile = (r: { path: string }) => (r.path.endsWith('/info/') ? json({}, 429) : undefined);
+
+  it('still completes and flags the missing counts', async () => {
+    const { promise } = run({ following: accounts('1'), followers: accounts('1'), intercept: noProfile });
+    const result = await promise;
+    expect(result.outcome).toBe('completed');
+    expect(result.stats.profileUnavailable).toBe(true);
+    expect(result.reportedFollowers).toBeNull();
+  });
+
+  it('uses the previous snapshot to catch an empty list', async () => {
+    const { promise } = run(
+      { following: accounts('1'), followers: [], intercept: noProfile },
+      { baseline: { followerIds: ['5', '6'], followingIds: ['1'] } },
+    );
+    const result = await promise;
+    expect(result.outcome).toBe('blocked');
+    expect(result.message).toMatch(/last snapshot had 2/);
+  });
+
+  it('refuses two empty lists when nothing says the account is really empty', async () => {
+    const { promise } = run({ intercept: noProfile });
+    const result = await promise;
+    expect(result.outcome).toBe('blocked');
+  });
+});
+
 describe('progress', () => {
   it('reports phases in order and ends with done', async () => {
     const { promise, progress } = run({ following: accounts('1'), followers: accounts('1') });
     await promise;
     const phases = progress.map(p => p.phase).filter((phase, i, all) => all[i - 1] !== phase);
-    expect(phases).toEqual(['profile', 'following', 'followers', 'verifying', 'done']);
+    expect(phases).toEqual(['profile', 'lists', 'verifying', 'done']);
   });
 });
 

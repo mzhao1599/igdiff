@@ -1,8 +1,9 @@
 import { render } from 'preact';
-import { useCallback, useEffect, useState } from 'preact/hooks';
+import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { browser } from 'wxt/browser';
 import type { CollectionProgress, CollectionResult } from '../../lib/collector/collect';
 import type { ProbeReport } from '../../lib/collector/probe';
+import { BUILD_ID } from '../../lib/env';
 import { INSTAGRAM_ORIGIN } from '../../lib/instagram/api';
 import {
   sendToBackground,
@@ -11,6 +12,7 @@ import {
   type EnvStatus,
   type ProbeResponse,
   type SyncStartResponse,
+  type SyncStopResponse,
 } from '../../lib/messages';
 import { computeRelationships, type Relationships } from '../../lib/tracker/diff';
 import {
@@ -81,11 +83,29 @@ function Person({ pk, profiles }: { pk: string; profiles: ReadonlyMap<string, Pr
   );
 }
 
+/**
+ * After a rebuild, this page loads fresh from disk while the background and the
+ * Instagram tab keep running the old code until they are reloaded.
+ */
+function staleBuildHint(env: EnvStatus | null): string | null {
+  if (!env) {
+    return null;
+  }
+  if (env.backgroundBuildId !== BUILD_ID) {
+    return 'The extension is running an older build than this page. On chrome://extensions click the reload arrow on Follower Tracker (dev), then reload the Instagram tab and this page.';
+  }
+  if (env.collector && env.collector.buildId !== BUILD_ID) {
+    return 'The Instagram tab is running an older build. Reload the Instagram tab (Cmd+R), then click Refresh here.';
+  }
+  return null;
+}
+
 function EnvSection({ env, onRefresh }: { env: EnvStatus | null; onRefresh: () => void }) {
+  const stale = staleBuildHint(env);
   return (
     <section>
       <h2>
-        Instagram tab {env && <Badge value={env.problem ? 'not ready' : 'ok'} />}
+        Instagram tab {env && <Badge value={env.problem || stale ? 'not ready' : 'ok'} />}
       </h2>
       {env ? (
         <dl class='facts'>
@@ -99,7 +119,8 @@ function EnvSection({ env, onRefresh }: { env: EnvStatus | null; onRefresh: () =
       ) : (
         <p class='muted'>Checking…</p>
       )}
-      {env?.problem && <p class='hint'>{PROBLEM_HINTS[env.problem]}</p>}
+      {stale && <p class='hint'>{stale}</p>}
+      {!stale && env?.problem && <p class='hint'>{PROBLEM_HINTS[env.problem]}</p>}
       <div class='row' style={{ marginTop: '12px' }}>
         <button onClick={onRefresh}>Refresh</button>
       </div>
@@ -133,11 +154,11 @@ function ProbeSection({ ready }: { ready: boolean }) {
     <section>
       <h2>Endpoint probe {report && <Badge value={report.verdict} />}</h2>
       <p class='muted'>
-        Up to 4 read-only requests (profile, first page of each list, one small friendship check). The report contains
-        no usernames or ids, so you can paste it into an issue.
+        Up to 5 read-only requests (profile, first page of each list, one bulk and one single friendship check). The
+        report contains no usernames or ids, so you can paste it into an issue.
       </p>
       <div class='row'>
-        <button class='primary' disabled={!ready || busy} onClick={run}>
+        <button class='primary' disabled={!ready || busy} onClick={() => void run()}>
           {busy ? 'Probing…' : 'Run probe'}
         </button>
         {report && (
@@ -164,7 +185,12 @@ function ProbeSection({ ready }: { ready: boolean }) {
                     <div class='muted'>{step.endpoint}</div>
                   </td>
                   <td>
-                    <Badge value={step.ok ? 'ok' : 'failed'} /> {step.status}
+                    {step.experiment ? (
+                      <span class='muted'>{step.ok ? 'answered' : 'refused'}</span>
+                    ) : (
+                      <Badge value={step.ok ? 'ok' : 'failed'} />
+                    )}{' '}
+                    {step.status}
                   </td>
                   <td>{step.ms} ms</td>
                   <td>
@@ -181,54 +207,101 @@ function ProbeSection({ ready }: { ready: boolean }) {
   );
 }
 
+const PHASE_LABELS: Record<CollectionProgress['phase'], string> = {
+  profile: 'Reading profile counts',
+  lists: 'Downloading both lists',
+  verifying: 'Checking accounts the lists could not settle',
+  done: 'Finished',
+};
+
+/** A running sync re-sends progress every 5 s; this long without one means it is gone. */
+const STALE_AFTER_MS = 20_000;
+
+function resultWarnings(result: CollectionResult): string[] {
+  const warnings: string[] = [];
+  const { stats } = result;
+  const repeatedFollowing = stats.followingRows - result.followingIds.length;
+  if (stats.hiddenFollowing) {
+    warnings.push(
+      `Instagram says it hides ${stats.hiddenFollowing} accounts from your following list, so your profile count will be higher than what the list returns.`,
+    );
+  }
+  if (repeatedFollowing > 0) {
+    warnings.push(
+      `The following list sent ${stats.followingRows} rows for ${result.followingIds.length} accounts: ${repeatedFollowing} repeats, which usually means the order shifted while paging and some accounts were skipped.`,
+    );
+  }
+  if (stats.followerRows > stats.listedFollowers) {
+    warnings.push(
+      `The followers list sent ${stats.followerRows} rows for ${stats.listedFollowers} accounts (${stats.followerRows - stats.listedFollowers} repeats).`,
+    );
+  }
+  if (result.stats.profileUnavailable) {
+    warnings.push("Instagram's profile counts were unavailable, so list coverage can't be checked against them.");
+  }
+  if (result.stats.bulkCheckUnavailable) {
+    warnings.push(
+      result.stats.singleChecks > 0
+        ? `The bulk friendship check was refused, so ${result.stats.singleChecks} apparent changes were checked one by one.`
+        : 'The bulk friendship check was refused, so accounts the lists could not settle were left as they are.',
+    );
+  }
+  if (result.stats.singleCheckUnavailable) {
+    warnings.push('Some apparent changes could not be checked and are recorded as unconfirmed.');
+  }
+  return warnings;
+}
+
 function SyncSection({
   ready,
-  collectorRunning,
+  running,
   progress,
+  lastSeenAt,
+  now,
+  note,
   result,
   commit,
-  onStarted,
+  onStart,
+  onStop,
+  stopping,
 }: {
   ready: boolean;
-  collectorRunning: boolean;
+  running: boolean;
   progress: CollectionProgress | null;
+  lastSeenAt: number;
+  now: number;
+  note: string | null;
   result: CollectionResult | null;
   commit: CommitOutcome | null;
-  onStarted: () => void;
+  onStart: () => void;
+  onStop: () => void;
+  stopping: boolean;
 }) {
-  const [error, setError] = useState<string | null>(null);
-  const running = collectorRunning || (progress !== null && progress.phase !== 'done');
-
-  const start = async () => {
-    setError(null);
-    const response = await sendToBackground<SyncStartResponse>({ type: 'sync:start' });
-    if (response.ok) {
-      onStarted();
-    } else {
-      setError(PROBLEM_HINTS[response.error]);
-    }
-  };
+  const live = progress !== null && progress.phase !== 'done';
+  const silentFor = now - lastSeenAt;
 
   return (
     <section>
-      <h2>Sync {result && <Badge value={result.outcome} />}</h2>
+      <h2>Sync {!running && result && <Badge value={result.outcome} />}</h2>
       <p class='muted'>
-        Full read-only pass over both lists with the default pacing (about 2–3.5 s per page plus a cooldown every 5
-        pages). Large accounts take a while. Only a completed sync is saved.
+        Downloads both lists back to back and only slows down if Instagram pushes back (HTTP 429). Only a completed sync
+        is saved.
       </p>
       <div class='row'>
-        <button class='primary' disabled={!ready || running} onClick={() => void start()}>
+        <button class='primary' disabled={!ready || running} onClick={onStart}>
           Sync now
         </button>
-        <button disabled={!running} onClick={() => void sendToBackground({ type: 'sync:stop' })}>
-          Stop
+        <button disabled={!running || stopping} onClick={onStop}>
+          {stopping ? 'Stopping…' : 'Stop'}
         </button>
       </div>
-      {error && <p class='hint'>{error}</p>}
-      {progress && (
+      {note && <p class='hint'>{note}</p>}
+      {live && progress && (
         <dl class='facts' style={{ marginTop: '12px' }}>
           <dt>Phase</dt>
-          <dd>{progress.phase}</dd>
+          <dd>{PHASE_LABELS[progress.phase] ?? progress.phase}</dd>
+          <dt>Elapsed</dt>
+          <dd>{Number.isFinite(progress.startedAt) ? formatSeconds(now - progress.startedAt) : '—'}</dd>
           <dt>Following</dt>
           <dd>
             {progress.following}
@@ -239,31 +312,49 @@ function SyncSection({
             {progress.followers}
             {progress.reportedFollowers !== null && ` / ${progress.reportedFollowers}`}
           </dd>
+          {progress.phase === 'verifying' && (
+            <>
+              <dt>Checked</dt>
+              <dd>
+                {progress.checked} / {progress.toCheck}
+              </dd>
+            </>
+          )}
           <dt>Requests</dt>
           <dd>{progress.requests}</dd>
           <dt>Last HTTP status</dt>
           <dd>{progress.lastStatus ?? '—'}</dd>
-          {progress.waiting && (
+          {progress.waiting && progress.waiting.endsAt > now && (
             <>
               <dt>Waiting</dt>
               <dd>
-                {progress.waiting.reason} for {formatSeconds(progress.waiting.ms)}
+                {progress.waiting.reason}, {formatSeconds(progress.waiting.endsAt - now)} left
                 {progress.waiting.attempt > 0 && ` (retry ${progress.waiting.attempt})`}
               </dd>
             </>
           )}
+          <dt>Last update</dt>
+          <dd class={silentFor > 10_000 ? 'muted' : ''}>{formatSeconds(Math.max(0, silentFor))} ago</dd>
         </dl>
       )}
-      {result && (
+      {result && !running && (
         <>
           {result.message && <p class='hint'>{result.message}</p>}
+          {resultWarnings(result).map(warning => (
+            <p class='hint' key={warning}>
+              {warning}
+            </p>
+          ))}
+          <p class='muted' style={{ margin: '8px 0 0' }}>
+            Took {formatSeconds(result.finishedAt - result.startedAt)} and {result.stats.requests} requests.
+          </p>
           <details style={{ marginTop: '8px' }}>
             <summary>Collection stats</summary>
             <pre>{JSON.stringify(result.stats, null, 2)}</pre>
           </details>
         </>
       )}
-      {commit && (
+      {commit && !running && (
         <p class='hint'>
           <Badge value={commit.status} />{' '}
           {commit.status === 'committed'
@@ -395,7 +486,10 @@ function DataSection({ refreshKey }: { refreshKey: number }) {
                 </div>
                 <div class='stat'>
                   <b>{latest.followingCount}</b>
-                  <span>following{coverage(latest.followingCount, latest.reportedFollowingCount)}</span>
+                  <span>
+                    following{coverage(latest.followingCount, latest.reportedFollowingCount)}
+                    {latest.stats.hiddenFollowing ? ` · ${latest.stats.hiddenFollowing} hidden by Instagram` : ''}
+                  </span>
                 </div>
                 <div class='stat'>
                   <b>{rel.notFollowingBack.length}</b>
@@ -503,22 +597,35 @@ function DataSection({ refreshKey }: { refreshKey: number }) {
 function App() {
   const [env, setEnv] = useState<EnvStatus | null>(null);
   const [progress, setProgress] = useState<CollectionProgress | null>(null);
+  const [lastSeenAt, setLastSeenAt] = useState(0);
+  const [now, setNow] = useState(() => Date.now());
   const [result, setResult] = useState<CollectionResult | null>(null);
   const [commit, setCommit] = useState<CommitOutcome | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+  const [stopping, setStopping] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
+  const lastStaleCheck = useRef(0);
 
-  const refreshEnv = useCallback(() => {
-    void sendToBackground<EnvStatus>({ type: 'env:status' }).then(setEnv);
+  const refreshEnv = useCallback(async (): Promise<EnvStatus> => {
+    const status = await sendToBackground<EnvStatus>({ type: 'env:status' });
+    setEnv(status);
+    // Page opened (or reopened) while a sync runs: pick up where it is.
+    if (status.collector?.running && status.collector.progress) {
+      const running = status.collector.progress;
+      setProgress(current => current ?? running);
+      setLastSeenAt(seen => Math.max(seen, Date.now()));
+    }
+    return status;
   }, []);
 
   useEffect(() => {
-    refreshEnv();
+    void refreshEnv();
     const onTabUpdated = (_tabId: number, change: { status?: string }) => {
       if (change.status === 'complete') {
-        refreshEnv();
+        void refreshEnv();
       }
     };
-    const onTabRemoved = () => refreshEnv();
+    const onTabRemoved = () => void refreshEnv();
     browser.tabs.onUpdated.addListener(onTabUpdated);
     browser.tabs.onRemoved.addListener(onTabRemoved);
 
@@ -527,12 +634,16 @@ function App() {
       const msg = message as Broadcast;
       if (msg.type === 'collector:progress') {
         setProgress(msg.progress);
+        setLastSeenAt(Date.now());
       } else if (msg.type === 'collector:finished') {
         setResult(msg.result);
+        setProgress(null);
+        setStopping(false);
+        setNote(null);
       } else if (msg.type === 'sync:committed') {
         setCommit(msg.outcome);
         setRefreshKey(n => n + 1);
-        refreshEnv();
+        void refreshEnv();
       }
     };
     browser.runtime.onMessage.addListener(onBroadcast);
@@ -543,31 +654,94 @@ function App() {
     };
   }, [refreshEnv]);
 
-  const ready = env !== null && env.problem === null;
+  const live = progress !== null && progress.phase !== 'done';
+
+  // Tick once a second while a sync is live, for the countdown and the staleness check.
+  useEffect(() => {
+    if (!live) {
+      return;
+    }
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [live]);
+
+  // No progress for a while: ask the tab whether the sync is still there.
+  useEffect(() => {
+    if (!live || now - lastSeenAt < STALE_AFTER_MS || now - lastStaleCheck.current < 10_000) {
+      return;
+    }
+    lastStaleCheck.current = now;
+    void refreshEnv().then(status => {
+      if (!status.collector?.running) {
+        setProgress(null);
+        setStopping(false);
+        setNote(
+          'The sync ended without reporting a result: the Instagram tab was probably reloaded, closed, or put to sleep. Nothing was saved.',
+        );
+      }
+    });
+  }, [live, now, lastSeenAt, refreshEnv]);
+
+  const start = async () => {
+    setNote(null);
+    const response = await sendToBackground<SyncStartResponse>({ type: 'sync:start' });
+    if (response.ok) {
+      setResult(null);
+      setCommit(null);
+      setProgress(null);
+      setLastSeenAt(Date.now());
+      setNow(Date.now());
+      void refreshEnv();
+    } else {
+      setNote(PROBLEM_HINTS[response.error]);
+    }
+  };
+
+  const stop = async () => {
+    setStopping(true);
+    try {
+      const response = await sendToBackground<SyncStopResponse>({ type: 'sync:stop' });
+      if (response.stopped === 0) {
+        setProgress(null);
+        setStopping(false);
+        setNote('No sync was running anymore (the Instagram tab was probably reloaded or closed). Nothing was saved.');
+        void refreshEnv();
+      } else {
+        setNote('Stopping…');
+      }
+    } catch (error) {
+      setStopping(false);
+      setNote(`Could not reach the extension's background script: ${String(error)}`);
+    }
+  };
+
+  const ready = env !== null && env.problem === null && staleBuildHint(env) === null;
+  const running = live || (env?.collector?.running ?? false);
 
   return (
     <main>
       <header>
         <h1>Follower Tracker diagnostics</h1>
         <p>
-          Development build only. Version {browser.runtime.getManifest().version}. All data stays in this browser's
-          extension storage.
+          Development build only. Version {browser.runtime.getManifest().version}, built{' '}
+          {BUILD_ID === 'unbuilt' ? 'from source' : new Date(BUILD_ID).toLocaleString()}. All data stays in this
+          browser's extension storage.
         </p>
       </header>
-      <EnvSection env={env} onRefresh={refreshEnv} />
+      <EnvSection env={env} onRefresh={() => void refreshEnv()} />
       <ProbeSection ready={ready} />
       <SyncSection
         ready={ready}
-        collectorRunning={env?.collector?.running ?? false}
+        running={running}
         progress={progress}
+        lastSeenAt={lastSeenAt}
+        now={now}
+        note={note}
         result={result}
         commit={commit}
-        onStarted={() => {
-          setResult(null);
-          setCommit(null);
-          setProgress(null);
-          refreshEnv();
-        }}
+        onStart={() => void start()}
+        onStop={() => void stop()}
+        stopping={stopping}
       />
       <DataSection refreshKey={refreshKey} />
     </main>

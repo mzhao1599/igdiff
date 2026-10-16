@@ -18,7 +18,8 @@ export const INSTAGRAM_ORIGIN = 'https://www.instagram.com';
 const IG_APP_ID = '936619743392459';
 
 export const MIN_PAGE_SIZE = 10;
-export const MAX_PAGE_SIZE = 100;
+/** Upper bound we ever ask for. Instagram may still return fewer per page. */
+export const MAX_PAGE_SIZE = 200;
 export const DEFAULT_PAGE_SIZE = 50;
 
 /** A 2xx response whose body was not usable data (HTML challenge page, `{status: "fail"}`). */
@@ -51,10 +52,19 @@ export interface FailureInfo {
   readonly spam: boolean;
 }
 
+/** What came back, for diagnostics. Never contains the body itself. */
+export interface ResponseInfo {
+  readonly contentType: string | null;
+  readonly bodyKind: 'json' | 'json-prefixed' | 'html' | 'empty' | 'text';
+  readonly bytes: number;
+}
+
 export interface ApiResult<T> {
   readonly status: number;
   readonly data: T | null;
   readonly failure: FailureInfo | null;
+  /** Absent when the request never got a response (network error). */
+  readonly response?: ResponseInfo;
 }
 
 /** Response shape facts for diagnostics. Never contains user data. */
@@ -67,6 +77,16 @@ export interface ListPageShape {
   readonly bigList: boolean | null;
   readonly hasRankToken: boolean;
   readonly usersWithFriendshipStatus: number;
+  /** Kind of `next_max_id`: a plain number can be used as an offset to fetch pages in parallel. */
+  readonly cursorKind: 'numeric' | 'json' | 'opaque' | null;
+  /** True when the numeric cursor equals the number of users on this (first) page. */
+  readonly cursorLooksLikeOffset: boolean;
+  /** `hidden_following_account_count`: followed accounts Instagram leaves out of the list. */
+  readonly hiddenCount: number | null;
+  /** `page_size` as Instagram reports it. */
+  readonly pageSizeField: number | null;
+  readonly shouldLimitFollowers: boolean | null;
+  readonly shouldLimitFollowings: boolean | null;
 }
 
 export interface ListPage {
@@ -117,6 +137,22 @@ export interface RawListResponse {
   big_list?: boolean;
   status?: string;
   follow_ranking_token?: string;
+  hidden_following_account_count?: number;
+  page_size?: number;
+  should_limit_list_of_followers?: boolean;
+  should_limit_list_of_followings?: boolean;
+}
+
+/** Sort orders to try instead of Instagram's default ranking. Unverified: see the probe experiment. */
+export type ListOrder = 'date_followed_latest' | 'date_followed_earliest';
+
+export interface ListPageOptions {
+  readonly maxId?: string | null;
+  readonly rankToken?: string | null;
+  readonly count?: number;
+  readonly order?: ListOrder | null;
+  /** The web app sends `search_surface=follow_list_page`. Default true. */
+  readonly searchSurface?: boolean;
 }
 
 interface RawFailureBody {
@@ -207,7 +243,24 @@ export function normalizeUser(raw: RawUser): IgUser | null {
 export function describeListShape(json: RawListResponse): ListPageShape {
   const users = Array.isArray(json.users) ? json.users : [];
   const first = users[0];
+  const cursor = json.next_max_id;
+  const cursorKind: ListPageShape['cursorKind'] =
+    cursor === undefined || cursor === null
+      ? null
+      : typeof cursor === 'object'
+        ? 'json'
+        : /^\d+$/.test(String(cursor))
+          ? 'numeric'
+          : 'opaque';
+  const numberOrNull = (value: unknown) => (typeof value === 'number' ? value : null);
+  const booleanOrNull = (value: unknown) => (typeof value === 'boolean' ? value : null);
   return {
+    cursorKind,
+    cursorLooksLikeOffset: cursorKind === 'numeric' && Number(cursor) === users.length,
+    hiddenCount: numberOrNull(json.hidden_following_account_count),
+    pageSizeField: numberOrNull(json.page_size),
+    shouldLimitFollowers: booleanOrNull(json.should_limit_list_of_followers),
+    shouldLimitFollowings: booleanOrNull(json.should_limit_list_of_followings),
     topLevelKeys: Object.keys(json).sort(),
     userKeys: first && typeof first === 'object' ? Object.keys(first).sort() : [],
     rawUserCount: users.length,
@@ -247,6 +300,38 @@ function buildHeaders(client: InstagramClient, extra: Record<string, string> = {
   return headers;
 }
 
+/** Meta prefixes some JSON responses with this to block cross-site script inclusion. */
+const XSSI_PREFIX = 'for (;;);';
+
+export function parseResponseBody(
+  text: string,
+  contentType: string | null,
+): { body: unknown; info: ResponseInfo } {
+  const trimmed = text.trimStart();
+  const prefixed = trimmed.startsWith(XSSI_PREFIX);
+  const jsonText = prefixed ? trimmed.slice(XSSI_PREFIX.length) : trimmed;
+  const bytes = text.length;
+  let body: unknown = null;
+  let parsed = false;
+  try {
+    body = JSON.parse(jsonText);
+    parsed = true;
+  } catch {
+    body = null;
+  }
+  let bodyKind: ResponseInfo['bodyKind'];
+  if (parsed) {
+    bodyKind = prefixed ? 'json-prefixed' : 'json';
+  } else if (trimmed === '') {
+    bodyKind = 'empty';
+  } else if (trimmed.startsWith('<') || (contentType ?? '').includes('html')) {
+    bodyKind = 'html';
+  } else {
+    bodyKind = 'text';
+  }
+  return { body, info: { contentType, bodyKind, bytes } };
+}
+
 async function requestJson<T>(client: InstagramClient, url: string, init: RequestInit = {}): Promise<ApiResult<T>> {
   let response: Response;
   let text: string;
@@ -257,33 +342,33 @@ async function requestJson<T>(client: InstagramClient, url: string, init: Reques
     return { status: STATUS_NETWORK_ERROR, data: null, failure: null };
   }
 
-  let body: unknown = null;
-  try {
-    body = JSON.parse(text);
-  } catch {
-    body = null;
-  }
+  const { body, info } = parseResponseBody(text, response.headers.get('content-type'));
   const finalUrl = response.url || url;
 
   if (!isOkStatus(response.status)) {
-    return { status: response.status, data: null, failure: parseFailureBody(body, finalUrl) };
+    return { status: response.status, data: null, failure: parseFailureBody(body, finalUrl), response: info };
   }
   // A 2xx that is HTML (login/challenge page) or an explicit `status: "fail"` is not data.
   if (body === null || typeof body !== 'object' || (body as { status?: unknown }).status === 'fail') {
-    return { status: STATUS_SOFT_BLOCK, data: null, failure: parseFailureBody(body, finalUrl) };
+    return { status: STATUS_SOFT_BLOCK, data: null, failure: parseFailureBody(body, finalUrl), response: info };
   }
-  return { status: response.status, data: body as T, failure: null };
+  return { status: response.status, data: body as T, failure: null, response: info };
 }
 
 export async function fetchListPage(
   client: InstagramClient,
   viewerId: string,
   kind: ListKind,
-  options: { maxId?: string | null; rankToken?: string | null; count?: number } = {},
+  options: ListPageOptions = {},
 ): Promise<ApiResult<ListPage>> {
   const url = new URL(`${INSTAGRAM_ORIGIN}/api/v1/friendships/${encodeURIComponent(viewerId)}/${kind}/`);
   url.searchParams.set('count', String(clampPageSize(options.count)));
-  url.searchParams.set('search_surface', 'follow_list_page');
+  if (options.searchSurface !== false) {
+    url.searchParams.set('search_surface', 'follow_list_page');
+  }
+  if (options.order) {
+    url.searchParams.set('order', options.order);
+  }
   if (options.maxId) {
     url.searchParams.set('max_id', options.maxId);
   }
@@ -293,7 +378,7 @@ export async function fetchListPage(
 
   const result = await requestJson<RawListResponse>(client, url.toString(), { headers: buildHeaders(client) });
   if (result.data === null) {
-    return { status: result.status, data: null, failure: result.failure };
+    return { ...result, data: null };
   }
 
   const json = result.data;
@@ -303,8 +388,7 @@ export async function fetchListPage(
   const lastPk = users.at(-1)?.pk ?? null;
 
   return {
-    status: result.status,
-    failure: null,
+    ...result,
     data: {
       users,
       nextMaxId: parseNextMaxId(json, lastPk),
@@ -331,11 +415,10 @@ export async function fetchProfile(client: InstagramClient, userId: string): Pro
   );
   const user = result.data?.user;
   if (!user) {
-    return { status: result.data ? STATUS_SOFT_BLOCK : result.status, data: null, failure: result.failure };
+    return { ...result, status: result.data ? STATUS_SOFT_BLOCK : result.status, data: null };
   }
   return {
-    status: result.status,
-    failure: null,
+    ...result,
     data: {
       pk: String(user.pk ?? userId),
       username: typeof user.username === 'string' ? user.username : null,
@@ -363,7 +446,7 @@ export async function fetchFriendshipStatuses(
     body: `user_ids=${userIds.map(encodeURIComponent).join(',')}`,
   });
   if (result.data === null) {
-    return { status: result.status, data: null, failure: result.failure };
+    return { ...result, data: null };
   }
 
   const statuses = new Map<string, FriendshipFlags>();
@@ -376,5 +459,35 @@ export async function fetchFriendshipStatuses(
       followedBy: typeof raw.followed_by === 'boolean' ? raw.followed_by : null,
     });
   }
-  return { status: result.status, data: statuses, failure: null };
+  return { ...result, data: statuses };
+}
+
+interface RawFriendshipShowResponse extends RawFriendship {
+  friendship_status?: RawFriendship;
+}
+
+/**
+ * Friendship status for one account. Slower than `fetchFriendshipStatuses` (one
+ * request per account), so only used when the bulk endpoint is unavailable.
+ */
+export async function fetchFriendshipStatus(
+  client: InstagramClient,
+  userId: string,
+): Promise<ApiResult<FriendshipFlags>> {
+  const result = await requestJson<RawFriendshipShowResponse>(
+    client,
+    `${INSTAGRAM_ORIGIN}/api/v1/friendships/show/${encodeURIComponent(userId)}/`,
+    { headers: buildHeaders(client) },
+  );
+  if (result.data === null) {
+    return { ...result, data: null };
+  }
+  const source = result.data.friendship_status ?? result.data;
+  return {
+    ...result,
+    data: {
+      following: typeof source.following === 'boolean' ? source.following : null,
+      followedBy: typeof source.followed_by === 'boolean' ? source.followed_by : null,
+    },
+  };
 }

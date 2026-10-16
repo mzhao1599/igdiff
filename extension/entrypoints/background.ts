@@ -10,37 +10,67 @@ import {
   type ProbeResponse,
   type RuntimeMessage,
   type SyncStartResponse,
+  type SyncStopResponse,
 } from '../lib/messages';
 import type { ProbeReport } from '../lib/collector/probe';
 import { TrackerStore } from '../lib/tracker/store';
-import { DIAGNOSTICS_ENABLED } from '../lib/env';
+import { BUILD_ID, DIAGNOSTICS_ENABLED } from '../lib/env';
 
 export default defineBackground(() => {
   const store = TrackerStore.open();
 
-  async function findInstagramTab(): Promise<Browser.tabs.Tab | null> {
+  async function instagramTabs(): Promise<Array<Browser.tabs.Tab & { id: number }>> {
     const tabs = await browser.tabs.query({ url: `${INSTAGRAM_ORIGIN}/*` });
-    const usable = tabs.filter(tab => tab.id !== undefined && !tab.discarded);
-    return usable.find(tab => tab.active) ?? usable[0] ?? null;
+    return tabs.filter((tab): tab is Browser.tabs.Tab & { id: number } => tab.id !== undefined && !tab.discarded);
   }
 
+  /**
+   * Asks every Instagram tab for its status and picks the one to talk to: the tab
+   * already syncing, else the active signed-in one, else any signed-in one.
+   */
   async function readEnv(): Promise<EnvStatus> {
-    const tab = await findInstagramTab();
-    if (!tab?.id) {
-      return { tabId: null, tabUrl: null, collector: null, problem: 'no_instagram_tab' };
+    const tabs = await instagramTabs();
+    if (tabs.length === 0) {
+      return { backgroundBuildId: BUILD_ID, tabId: null, tabUrl: null, collector: null, problem: 'no_instagram_tab' };
     }
-    try {
-      const collector = await sendToTab<CollectorStatus>(tab.id, { type: 'collector:status' });
-      return {
-        tabId: tab.id,
-        tabUrl: tab.url ?? null,
-        collector,
-        problem: collector.viewerId ? null : 'signed_out',
-      };
-    } catch {
-      // Tabs opened before the extension was installed or reloaded have no content script yet.
-      return { tabId: tab.id, tabUrl: tab.url ?? null, collector: null, problem: 'content_script_missing' };
+    const statuses = await Promise.all(
+      tabs.map(async tab => {
+        try {
+          return { tab, collector: await sendToTab<CollectorStatus>(tab.id, { type: 'collector:status' }) };
+        } catch {
+          // Tabs opened before the extension was installed or reloaded have no content script yet.
+          return { tab, collector: null };
+        }
+      }),
+    );
+    const reachable = statuses.filter(entry => entry.collector !== null);
+    const pick =
+      reachable.find(entry => entry.collector?.running) ??
+      reachable.find(entry => entry.collector?.viewerId && entry.tab.active) ??
+      reachable.find(entry => entry.collector?.viewerId) ??
+      reachable[0];
+    if (!pick) {
+      const tab = tabs.find(candidate => candidate.active) ?? tabs[0]!;
+      return { backgroundBuildId: BUILD_ID, tabId: tab.id, tabUrl: tab.url ?? null, collector: null, problem: 'content_script_missing' };
     }
+    return {
+      backgroundBuildId: BUILD_ID,
+      tabId: pick.tab.id,
+      tabUrl: pick.tab.url ?? null,
+      collector: pick.collector,
+      problem: pick.collector?.viewerId ? null : 'signed_out',
+    };
+  }
+
+  /** Sends Stop to every Instagram tab, so it reaches the sync wherever it runs. */
+  async function stopSync(): Promise<SyncStopResponse> {
+    const tabs = await instagramTabs();
+    const answers = await Promise.all(
+      tabs.map(tab =>
+        sendToTab<{ stopping: boolean }>(tab.id, { type: 'collector:stop' }).catch(() => ({ stopping: false })),
+      ),
+    );
+    return { ok: true, stopped: answers.filter(answer => answer.stopping).length };
   }
 
   async function startSync(): Promise<SyncStartResponse> {
@@ -76,13 +106,7 @@ export default defineBackground(() => {
       case 'sync:start':
         return startSync();
       case 'sync:stop':
-        return (async () => {
-          const env = await readEnv();
-          if (env.tabId !== null && env.collector) {
-            await sendToTab(env.tabId, { type: 'collector:stop' });
-          }
-          return { ok: true };
-        })();
+        return stopSync();
       case 'collector:finished': {
         // Only accept results from our own content script on an Instagram tab.
         if (!sender.tab || sender.id !== browser.runtime.id || !sender.url?.startsWith(`${INSTAGRAM_ORIGIN}/`)) {

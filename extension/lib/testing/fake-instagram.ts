@@ -31,6 +31,10 @@ export interface FakeInstagramOptions {
   readonly followingChunk?: number;
   readonly reportedFollowers?: number | null;
   readonly reportedFollowing?: number | null;
+  /** Sent as `hidden_following_account_count` on following pages. */
+  readonly hiddenFollowing?: number;
+  /** Honor `order=date_followed_latest` by reversing the following list. */
+  readonly supportsOrder?: boolean;
   /** Overrides for show_many. `null` leaves an account out of the response (deactivated/unavailable). */
   readonly friendships?: Readonly<Record<string, { following?: boolean; followed_by?: boolean } | null>>;
   /** Return a Response to replace the default answer for a request. */
@@ -69,7 +73,12 @@ export function createFakeInstagram(options: FakeInstagramOptions = {}) {
   const requests: FakeRequest[] = [];
   const counts = new Map<string, number>();
 
-  const page = (list: readonly FakeAccount[], params: URLSearchParams, chunk: number | undefined) => {
+  const page = (
+    list: readonly FakeAccount[],
+    params: URLSearchParams,
+    chunk: number | undefined,
+    extra: Record<string, unknown> = {},
+  ) => {
     const offset = Number(params.get('max_id') ?? '0');
     const size = Math.min(Number(params.get('count') ?? '50'), chunk ?? Infinity);
     const slice = list.slice(offset, offset + size);
@@ -79,6 +88,7 @@ export function createFakeInstagram(options: FakeInstagramOptions = {}) {
       big_list: next !== null,
       ...(next !== null ? { next_max_id: next } : {}),
       follow_ranking_token: 'rank-token',
+      ...extra,
       status: 'ok',
     });
   };
@@ -109,10 +119,32 @@ export function createFakeInstagram(options: FakeInstagramOptions = {}) {
       });
     }
     if (url.pathname === `/api/v1/friendships/${viewerId}/following/`) {
-      return page(following, url.searchParams, options.followingChunk);
+      const ordered =
+        options.supportsOrder && url.searchParams.get('order') === 'date_followed_latest' ? [...following].reverse() : following;
+      return page(
+        ordered,
+        url.searchParams,
+        options.followingChunk,
+        options.hiddenFollowing === undefined ? {} : { hidden_following_account_count: options.hiddenFollowing },
+      );
     }
     if (url.pathname === `/api/v1/friendships/${viewerId}/followers/`) {
       return page(followers, url.searchParams, options.followersChunk);
+    }
+    const single = /^\/api\/v1\/friendships\/show\/([^/]+)\/$/.exec(url.pathname);
+    if (single && method === 'GET') {
+      const id = decodeURIComponent(single[1]!);
+      const override = options.friendships?.[id];
+      if (override === null) {
+        return json({ message: 'User not found', status: 'fail' }, 404);
+      }
+      return json({
+        ...(override ?? {
+          following: following.some(account => account.pk === id),
+          followed_by: followers.some(account => account.pk === id),
+        }),
+        status: 'ok',
+      });
     }
     if (url.pathname === '/api/v1/friendships/show_many/' && method === 'POST') {
       const ids = new URLSearchParams(body ?? '').get('user_ids')?.split(',') ?? [];

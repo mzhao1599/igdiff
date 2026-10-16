@@ -5,11 +5,18 @@ import { defineConfig } from 'wxt';
 // so nothing here ships to users.
 const DEV_ONLY_ENTRYPOINTS = new Set(['diagnostics']);
 
+// Stamped into every entrypoint so the diagnostics page can spot a stale background
+// or Instagram tab after a rebuild. Computed once so all entrypoints agree.
+const BUILD_ID = new Date().toISOString();
+
 export default defineConfig({
   // Explicit imports everywhere: easier to read for contributors than auto-imports.
   imports: false,
   vite: () => ({
     plugins: [preact()],
+    define: {
+      __BUILD_ID__: JSON.stringify(BUILD_ID),
+    },
   }),
   // Instagram only works in a profile where you are already signed in, so we load
   // the build into your normal Chrome profile by hand instead of letting WXT launch

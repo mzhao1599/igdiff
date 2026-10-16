@@ -20,8 +20,18 @@ export type ContentRequest =
   | { readonly type: 'collector:stop' };
 
 export interface CollectorStatus {
+  /** Build of the content script answering. Older than the page's build means the tab needs a reload. */
+  readonly buildId: string;
   readonly viewerId: string | null;
   readonly running: boolean;
+  /** Latest progress of the running sync, so a freshly opened page can pick it up. */
+  readonly progress: CollectionProgress | null;
+}
+
+export interface SyncStopResponse {
+  readonly ok: true;
+  /** How many tabs actually had a sync running. 0 means there was nothing to stop. */
+  readonly stopped: number;
 }
 
 // Page → background (via runtime.sendMessage).
@@ -34,6 +44,7 @@ export type BackgroundRequest =
 export type EnvProblem = 'no_instagram_tab' | 'content_script_missing' | 'signed_out';
 
 export interface EnvStatus {
+  readonly backgroundBuildId: string;
   readonly tabId: number | null;
   readonly tabUrl: string | null;
   readonly collector: CollectorStatus | null;
