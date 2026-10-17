@@ -20,7 +20,7 @@ function run(fakeOptions: FakeInstagramOptions, pks: string[], overrides: Partia
 }
 
 const unfollowCalls = (requests: Array<{ path: string; method: string }>) =>
-  requests.filter(r => r.method === 'POST' && /unfollow\/$|destroy\//.test(r.path)).map(r => r.path);
+  requests.filter(r => r.method === 'POST' && r.path.includes('/destroy/')).map(r => r.path);
 
 describe('runUnfollows', () => {
   it('unfollows exactly the chosen accounts, pacing between them but not after the last', async () => {
@@ -32,7 +32,6 @@ describe('runUnfollows', () => {
       ['1', 'unfollowed'],
       ['3', 'unfollowed'],
     ]);
-    expect(result.endpoint).toBe('destroy');
     const { delayMs, jitterMs } = DEFAULT_UNFOLLOW_SETTINGS;
     expect(sleeps).toEqual([delayMs + Math.floor(0.5 * jitterMs)]);
   });
@@ -46,16 +45,16 @@ describe('runUnfollows', () => {
     expect(sleeps).toEqual([1, 999_000, 1, 999_000]);
   });
 
-  it('falls back to the older endpoint when the current one is gone, and sticks with it', async () => {
-    const { promise, fake } = run({ following: accounts('1', '2'), destroyGone: true }, ['1', '2']);
+  it('recovers from an expired page token without losing an account', async () => {
+    const { promise, fake } = run({ following: accounts('1', '2'), pageToken: 'expired' }, ['1', '2']);
     const result = await promise;
     expect(result.outcome).toBe('completed');
-    expect(result.endpoint).toBe('web');
     expect(fake.unfollowed).toEqual(['1', '2']);
+    expect(fake.freshPageLoads()).toBe(1);
     expect(unfollowCalls(fake.requests)).toEqual([
       '/api/v1/friendships/destroy/1/',
-      '/web/friendships/1/unfollow/',
-      '/web/friendships/2/unfollow/',
+      '/api/v1/friendships/destroy/1/',
+      '/api/v1/friendships/destroy/2/',
     ]);
   });
 
@@ -110,40 +109,25 @@ describe('runUnfollows', () => {
     expect(fake.unfollowed).toEqual(['1', '3']);
   });
 
-  it('never counts an HTML page as success', async () => {
-    const { promise, fake } = run(
-      { following: accounts('1'), intercept: r => (r.method === 'POST' && r.path.startsWith('/web/') ? html('<html/>') : undefined), destroyGone: true },
-      ['1'],
-    );
+  it('never counts an HTML page as success, and keeps the whole selection queued', async () => {
+    const { promise, fake } = run({ following: accounts('1', '2'), destroyGone: true }, ['1', '2']);
     const result = await promise;
-    expect(result.results.some(r => r.outcome === 'unfollowed')).toBe(false);
-    expect(fake.unfollowed).toEqual([]);
     expect(result.outcome).toBe('error');
-    expect(result.remaining).toEqual(['1']);
+    expect(result.results).toEqual([]);
+    expect(result.remaining).toEqual(['1', '2']);
+    expect(result.message).toMatch(/a page instead of data/);
+    expect(fake.unfollowed).toEqual([]);
+    // The first account only: once with the page's token, once with a fresh one.
+    expect(unfollowCalls(fake.requests)).toEqual(['/api/v1/friendships/destroy/1/', '/api/v1/friendships/destroy/1/']);
   });
 
-  it('falls back when the current endpoint answers a bare JSON 404 (seen on a real account)', async () => {
-    const { promise, fake } = run({ following: accounts('1', '2'), destroy404: true }, ['1', '2']);
-    const result = await promise;
-    expect(result.outcome).toBe('completed');
-    expect(result.endpoint).toBe('web');
-    expect(fake.unfollowed).toEqual(['1', '2']);
-  });
-
-  it('stops without skipping through the selection when neither endpoint works', async () => {
-    const { promise, fake } = run(
-      {
-        following: accounts('1', '2', '3'),
-        destroy404: true,
-        intercept: r => (r.method === 'POST' && r.path.startsWith('/web/') ? json({ status: 'fail' }, 404) : undefined),
-      },
-      ['1', '2', '3'],
-    );
+  it('stops on a bare JSON 404 before anything was unfollowed, instead of skipping through the selection', async () => {
+    const { promise, fake } = run({ following: accounts('1', '2', '3'), destroy404: true }, ['1', '2', '3']);
     const result = await promise;
     expect(result.outcome).toBe('error');
     expect(result.results).toEqual([]);
     expect(result.remaining).toEqual(['1', '2', '3']);
-    expect(result.message).toMatch(/destroy: HTTP 404.*web: HTTP 404/);
+    expect(result.message).toMatch(/HTTP 404/);
     expect(fake.unfollowed).toEqual([]);
   });
 

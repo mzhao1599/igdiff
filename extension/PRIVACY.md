@@ -12,7 +12,7 @@ When you have a `www.instagram.com` tab open and signed in, the extension reads,
 - for each of those accounts: username, full name, profile picture link, and whether it is private or verified;
 - whether a specific account follows you, to double-check apparent changes.
 
-It reads two of Instagram's cookies in that tab: `ds_user_id` (which account is signed in) and `csrftoken` (a header Instagram requires on its own requests). It never reads your password or Instagram's `sessionid` cookie.
+It reads two of Instagram's cookies in that tab: `ds_user_id` (which account is signed in) and `csrftoken` (a header Instagram requires on its own requests). For requests that send data (unfollowing, friendship checks), it also reads the request token Instagram puts in its own page and sends it back to Instagram, as Instagram's web app does; if that token has expired, it loads Instagram's home page once for a fresh one. It never reads your password or Instagram's `sessionid` cookie, and these values go nowhere but Instagram.
 
 ## What it stores, and where
 

@@ -6,7 +6,10 @@
  *   GET  /api/v1/friendships/{id}/followers/?count=N   followers list page
  *   POST /api/v1/friendships/show_many/                bulk friendship status
  *
- *   POST /api/v1/friendships/destroy/{id}/             unfollow (falls back to /web/friendships/{id}/unfollow/)
+ *   POST /api/v1/friendships/destroy/{id}/             unfollow
+ *
+ * POSTs carry what the web app adds to its own (page token, checksum, claim,
+ * revision): without them Instagram answers with its HTML app page.
  *
  * These are unofficial and change without notice, so every call returns its raw
  * status and a failure hint instead of throwing, and callers decide what a
@@ -33,10 +36,17 @@ export interface InstagramClient {
   readonly fetch: typeof fetch;
   readonly csrfToken: () => string | null;
   /**
-   * Extra headers Instagram's own web client sends (claim, AJAX revision, ASBD id).
-   * Only added to write requests; reads are proven to work without them.
+   * What Instagram's web app adds to its POSTs, read from the signed-in page.
+   * Only POSTs carry it; reads work without. `fresh` reloads it from a newly
+   * fetched page, for a tab open so long that its page token expired.
    */
-  readonly webClientHeaders?: () => Record<string, string>;
+  readonly webClient?: (options?: { readonly fresh?: boolean }) => Promise<WebClientContext>;
+}
+
+export interface WebClientContext {
+  readonly headers: Readonly<Record<string, string>>;
+  /** Form fields added to every POST body: `fb_dtsg` and `jazoest`. */
+  readonly fields: Readonly<Record<string, string>>;
 }
 
 export interface IgUser {
@@ -368,6 +378,32 @@ async function requestJson<T>(client: InstagramClient, url: string, init: Reques
   return { status: response.status, data: body as T, failure: null, response: info };
 }
 
+/**
+ * A form POST the way the web app sends one. If Instagram answers with its HTML
+ * app page, the page token may have expired: retry once with fresh values.
+ * Such an answer means the request was not processed, so retrying a write is safe.
+ */
+async function postForm<T>(client: InstagramClient, url: string, fields: Record<string, string>): Promise<ApiResult<T>> {
+  const send = async (fresh: boolean): Promise<ApiResult<T>> => {
+    let web: WebClientContext | null = null;
+    try {
+      web = (await client.webClient?.({ fresh })) ?? null;
+    } catch {
+      web = null;
+    }
+    return requestJson<T>(client, url, {
+      method: 'POST',
+      headers: buildHeaders(client, { ...web?.headers, 'content-type': 'application/x-www-form-urlencoded' }),
+      body: new URLSearchParams({ ...fields, ...web?.fields }).toString(),
+    });
+  };
+  const first = await send(false);
+  if (client.webClient && first.status === STATUS_SOFT_BLOCK && first.response?.bodyKind === 'html') {
+    return send(true);
+  }
+  return first;
+}
+
 export async function fetchListPage(
   client: InstagramClient,
   viewerId: string,
@@ -453,10 +489,8 @@ export async function fetchFriendshipStatuses(
   client: InstagramClient,
   userIds: readonly string[],
 ): Promise<ApiResult<ReadonlyMap<string, FriendshipFlags>>> {
-  const result = await requestJson<RawShowManyResponse>(client, `${INSTAGRAM_ORIGIN}/api/v1/friendships/show_many/`, {
-    method: 'POST',
-    headers: buildHeaders(client, { 'content-type': 'application/x-www-form-urlencoded' }),
-    body: `user_ids=${userIds.map(encodeURIComponent).join(',')}`,
+  const result = await postForm<RawShowManyResponse>(client, `${INSTAGRAM_ORIGIN}/api/v1/friendships/show_many/`, {
+    user_ids: userIds.join(','),
   });
   if (result.data === null) {
     return { ...result, data: null };
@@ -505,11 +539,7 @@ export async function fetchFriendshipStatus(
   };
 }
 
-/** Which unfollow endpoint answered. `destroy` is what the web app uses today; `web` is the older one. */
-export type UnfollowEndpoint = 'destroy' | 'web';
-
 export interface UnfollowAnswer {
-  readonly endpoint: UnfollowEndpoint;
   /** `friendship_status.following` after the call when Instagram sent it; must not be true. */
   readonly following: boolean | null;
 }
@@ -520,30 +550,15 @@ interface RawUnfollowResponse {
 }
 
 /**
- * Unfollows one account. Changes the user's account: only call this for an
- * account the user chose to unfollow.
+ * Unfollows one account, with the request the web app's own unfollow sends.
+ * Changes the user's account: only call this for an account the user chose to unfollow.
  */
-export async function unfollowUser(
-  client: InstagramClient,
-  userId: string,
-  endpoint: UnfollowEndpoint,
-): Promise<ApiResult<UnfollowAnswer>> {
-  const id = encodeURIComponent(userId);
-  const url =
-    endpoint === 'destroy'
-      ? `${INSTAGRAM_ORIGIN}/api/v1/friendships/destroy/${id}/`
-      : `${INSTAGRAM_ORIGIN}/web/friendships/${id}/unfollow/`;
-  const result = await requestJson<RawUnfollowResponse>(client, url, {
-    method: 'POST',
-    headers: buildHeaders(client, {
-      ...client.webClientHeaders?.(),
-      'content-type': 'application/x-www-form-urlencoded',
-    }),
-    body: endpoint === 'destroy' ? `user_id=${id}&container_module=profile` : '',
-  });
+export async function unfollowUser(client: InstagramClient, userId: string): Promise<ApiResult<UnfollowAnswer>> {
+  const url = `${INSTAGRAM_ORIGIN}/api/v1/friendships/destroy/${encodeURIComponent(userId)}/`;
+  const result = await postForm<RawUnfollowResponse>(client, url, { container_module: 'profile', user_id: userId });
   if (result.data === null) {
     return { ...result, data: null };
   }
   const following = result.data.friendship_status?.following;
-  return { ...result, data: { endpoint, following: typeof following === 'boolean' ? following : null } };
+  return { ...result, data: { following: typeof following === 'boolean' ? following : null } };
 }

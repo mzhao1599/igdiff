@@ -12,10 +12,10 @@
  * reports the friendship state, and then a read-only friendship check showing
  * the follow is really gone. An HTML page with status 200 is never a success.
  *
- * Until one endpoint has worked, any refusal from the current one means "try
- * the other": Instagram has answered the newer endpoint with a bare 404 on a
- * real account. If neither works on the first account, the run stops with both
- * answers and the queue intact rather than skipping through the selection.
+ * Until Instagram has accepted one unfollow in a run, a refusal says the
+ * request is wrong, not the account (Instagram has answered a malformed request
+ * with a bare 404 on a real account): the run stops with Instagram's answer and
+ * the queue intact rather than skipping through the selection.
  */
 import { abortableSleep, classifyFailure, describeStatus } from '../collector/collect';
 import {
@@ -26,7 +26,6 @@ import {
   type ApiResult,
   type InstagramClient,
   type UnfollowAnswer,
-  type UnfollowEndpoint,
 } from '../instagram/api';
 
 export interface UnfollowSettings {
@@ -74,7 +73,6 @@ export interface UnfollowRunResult {
   readonly results: readonly UnfollowItemResult[];
   /** Accounts not attempted (stopped, blocked or over the limit), in order. */
   readonly remaining: readonly string[];
-  readonly endpoint: UnfollowEndpoint | null;
 }
 
 export interface UnfollowOptions {
@@ -100,14 +98,14 @@ class RunStop extends Error {
   }
 }
 
-function describeAnswer(endpoint: UnfollowEndpoint, result: ApiResult<UnfollowAnswer>): string {
+function describeAnswer(result: ApiResult<UnfollowAnswer>): string {
   const message = result.failure?.message ? ` "${result.failure.message}"` : '';
   const body = result.response ? ` (${result.response.bodyKind})` : '';
-  return `${endpoint}: ${describeStatus(result.status)}${message}${body}`;
+  return `${describeStatus(result.status)}${message}${body}`;
 }
 
-/** The endpoint itself seems to be gone (not this account): HTML app page, empty body, 404/405 without JSON. */
-function endpointMissing(result: ApiResult<UnfollowAnswer>): boolean {
+/** Instagram refused the request itself, not this account: HTML app page, empty body, 404/405 without JSON. */
+function requestRefused(result: ApiResult<UnfollowAnswer>): boolean {
   const kind = result.response?.bodyKind;
   const notJson = kind === 'html' || kind === 'empty' || kind === 'text';
   return (
@@ -127,9 +125,7 @@ export async function runUnfollows(options: UnfollowOptions): Promise<UnfollowRu
   let unfollowed = 0;
   let index = 0;
   let current: string | null = null;
-  // Try the endpoint the web app uses today first; once one works, stick with it.
-  let endpoint: UnfollowEndpoint = 'destroy';
-  let endpointConfirmed = false;
+  let accepted = false;
 
   const emit = (waiting: UnfollowProgress['waiting'] = null) =>
     options.onProgress?.({ total: queue.length, done: results.length, unfollowed, current, waiting });
@@ -155,15 +151,14 @@ export async function runUnfollows(options: UnfollowOptions): Promise<UnfollowRu
     options.onItem?.(item);
   };
 
-  /** One account, with endpoint discovery and a single retry on transient errors. */
+  /** One account, with a single retry on transient errors. */
   async function unfollowOne(pk: string): Promise<void> {
-    const tried: string[] = [];
     for (let attempt = 0; ; attempt++) {
       checkStopped();
-      const result = await unfollowUser(client, pk, endpoint);
+      const result = await unfollowUser(client, pk);
 
       if (isOkStatus(result.status) && result.data) {
-        endpointConfirmed = true;
+        accepted = true;
         if (result.data.following === true) {
           record(pk, 'failed', 'Instagram still reports you follow this account.');
           return;
@@ -183,8 +178,7 @@ export async function runUnfollows(options: UnfollowOptions): Promise<UnfollowRu
 
       const failure = result.failure;
       const kind = classifyFailure(result.status, failure);
-      const detail = describeAnswer(endpoint, result);
-      // Hard stops, whichever endpoint answered.
+      const detail = describeAnswer(result);
       if (failure?.actionBlocked || failure?.spam) {
         throw new RunStop(
           'blocked',
@@ -195,17 +189,10 @@ export async function runUnfollows(options: UnfollowOptions): Promise<UnfollowRu
         throw new RunStop('blocked', 'Instagram asked to sign in again or finish a security check. Unfollowing stopped.');
       }
 
-      // Until an endpoint has worked, a refusal is about the endpoint, not this account.
-      if (!endpointConfirmed && (kind === 'fatal' || endpointMissing(result))) {
-        tried.push(detail);
-        if (endpoint === 'destroy') {
-          endpoint = 'web';
-          continue;
-        }
-        endpoint = 'destroy';
+      if (!accepted && (kind === 'fatal' || requestRefused(result))) {
         throw new RunStop(
           'error',
-          `Instagram didn't accept the unfollow request (${tried.join('; ')}). Nothing was unfollowed; the accounts stay queued.`,
+          `Instagram didn't accept the unfollow request (${detail}). Nothing was unfollowed; the accounts stay queued.`,
         );
       }
 
@@ -219,7 +206,7 @@ export async function runUnfollows(options: UnfollowOptions): Promise<UnfollowRu
       if (kind === 'transient') {
         throw new RunStop('error', 'Instagram could not be reached. Unfollowing stopped; try again later.');
       }
-      // The endpoint works, so this refusal is about this one account (deleted, deactivated, not followed).
+      // Unfollowing works, so this refusal is about this one account (deleted, deactivated, not followed).
       record(pk, result.status === 404 || result.status === 400 ? 'not_found' : 'failed', detail);
       return;
     }
@@ -269,6 +256,5 @@ export async function runUnfollows(options: UnfollowOptions): Promise<UnfollowRu
     message,
     results,
     remaining: queue.filter(pk => !attempted.has(pk)),
-    endpoint: endpointConfirmed ? endpoint : null,
   };
 }

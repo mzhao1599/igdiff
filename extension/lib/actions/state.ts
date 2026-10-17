@@ -4,7 +4,6 @@
  */
 import { browser } from 'wxt/browser';
 import type { UnfollowLedger } from './limits';
-import type { UnfollowEndpoint } from '../instagram/api';
 import type { UnfollowRunOutcome } from './unfollow';
 
 export type UnfollowJobStatus = 'running' | 'paused' | 'finished';
@@ -23,8 +22,6 @@ export interface UnfollowJob {
   readonly updatedAt: number;
   readonly outcome: UnfollowRunOutcome | 'interrupted' | null;
   readonly message: string | null;
-  /** The unfollow endpoint Instagram accepted on the last run, if any did. */
-  readonly endpoint?: UnfollowEndpoint | null;
 }
 
 interface UnfollowState {

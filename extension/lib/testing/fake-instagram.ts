@@ -1,8 +1,14 @@
 /**
- * In-memory stand-in for the four Instagram endpoints the collector uses.
+ * In-memory stand-in for the Instagram endpoints the extension uses.
  * Test-only: nothing in `entrypoints/` imports it.
  */
 import type { InstagramClient } from '../instagram/api';
+import { sprinkleValue } from '../instagram/session';
+
+const CSRF = 'csrf-test';
+const CURRENT_TOKEN = 'dtsg-current';
+const EXPIRED_TOKEN = 'dtsg-expired';
+const JAZOEST = sprinkleValue(CSRF, { paramName: 'jazoest', version: 2, randomize: false });
 
 export interface FakeAccount {
   readonly pk: string;
@@ -39,9 +45,15 @@ export interface FakeInstagramOptions {
    * or refused with a 400.
    */
   readonly orderBehavior?: 'ignored' | 'all-in-one' | 'rejected';
-  /** The current unfollow endpoint answers with the HTML app page, like a removed route. */
+  /**
+   * The page token the client's `webClient` hands out: current (default), expired
+   * until a fresh page is loaded, or none (no `webClient`). Like Instagram, every
+   * POST without the current token and checksum gets the HTML app page.
+   */
+  readonly pageToken?: 'current' | 'expired' | 'none';
+  /** The unfollow endpoint always answers with the HTML app page. */
   readonly destroyGone?: boolean;
-  /** The current unfollow endpoint answers with a bare JSON 404, as seen on a real account. */
+  /** The unfollow endpoint answers with a bare JSON 404, as seen on a real account for a request without the page token. */
   readonly destroy404?: boolean;
   /** Overrides for show_many. `null` leaves an account out of the response (deactivated/unavailable). */
   readonly friendships?: Readonly<Record<string, { following?: boolean; followed_by?: boolean } | null>>;
@@ -81,6 +93,7 @@ export function createFakeInstagram(options: FakeInstagramOptions = {}) {
   const requests: FakeRequest[] = [];
   const counts = new Map<string, number>();
   const unfollowed: string[] = [];
+  let freshPageLoads = 0;
 
   const page = (
     list: readonly FakeAccount[],
@@ -119,6 +132,10 @@ export function createFakeInstagram(options: FakeInstagramOptions = {}) {
     if (options.orderBehavior === 'rejected' && url.searchParams.has('order')) {
       return json({ message: 'Invalid parameter', status: 'fail' }, 400);
     }
+    const form = new URLSearchParams(body ?? '');
+    if (method === 'POST' && (form.get('fb_dtsg') !== CURRENT_TOKEN || form.get('jazoest') !== JAZOEST)) {
+      return html('<!doctype html><html>app</html>');
+    }
 
     if (url.pathname === `/api/v1/users/${viewerId}/info/`) {
       return json({
@@ -142,23 +159,20 @@ export function createFakeInstagram(options: FakeInstagramOptions = {}) {
     if (url.pathname === `/api/v1/friendships/${viewerId}/followers/`) {
       return page(followers, url.searchParams, options.followersChunk);
     }
-    const unfollow =
-      /^\/api\/v1\/friendships\/destroy\/([^/]+)\/$/.exec(url.pathname) ??
-      /^\/web\/friendships\/([^/]+)\/unfollow\/$/.exec(url.pathname);
+    const unfollow = /^\/api\/v1\/friendships\/destroy\/([^/]+)\/$/.exec(url.pathname);
     if (unfollow && method === 'POST') {
       const id = decodeURIComponent(unfollow[1]!);
-      const viaDestroy = url.pathname.startsWith('/api/v1/');
-      if (viaDestroy && options.destroyGone) {
+      if (options.destroyGone) {
         return html('<!doctype html><html>app</html>');
       }
-      if (viaDestroy && options.destroy404) {
+      if (options.destroy404) {
         return json({ status: 'fail' }, 404);
       }
       if (!following.some(account => account.pk === id)) {
         return json({ message: 'User not found', status: 'fail' }, 404);
       }
       unfollowed.push(id);
-      return json(viaDestroy ? { friendship_status: { following: false }, status: 'ok' } : { status: 'ok' });
+      return json({ friendship_status: { following: false }, status: 'ok' });
     }
     const single = /^\/api\/v1\/friendships\/show\/([^/]+)\/$/.exec(url.pathname);
     if (single && method === 'GET') {
@@ -176,7 +190,7 @@ export function createFakeInstagram(options: FakeInstagramOptions = {}) {
       });
     }
     if (url.pathname === '/api/v1/friendships/show_many/' && method === 'POST') {
-      const ids = new URLSearchParams(body ?? '').get('user_ids')?.split(',') ?? [];
+      const ids = form.get('user_ids')?.split(',') ?? [];
       const statuses: Record<string, unknown> = {};
       for (const id of ids) {
         const override = options.friendships?.[id];
@@ -193,8 +207,23 @@ export function createFakeInstagram(options: FakeInstagramOptions = {}) {
     return json({ message: 'not found', status: 'fail' }, 404);
   };
 
-  const client: InstagramClient = { fetch: fetchImpl as typeof fetch, csrfToken: () => 'csrf-test' };
-  return { client, requests, viewerId, unfollowed };
+  const pageToken = options.pageToken ?? 'current';
+  const client: InstagramClient = {
+    fetch: fetchImpl as typeof fetch,
+    csrfToken: () => CSRF,
+    ...(pageToken === 'none'
+      ? {}
+      : {
+          webClient: async ({ fresh = false } = {}) => {
+            if (fresh) {
+              freshPageLoads++;
+            }
+            const token = pageToken === 'expired' && freshPageLoads === 0 ? EXPIRED_TOKEN : CURRENT_TOKEN;
+            return { headers: { 'x-ig-www-claim': '0' }, fields: { fb_dtsg: token, jazoest: JAZOEST } };
+          },
+        }),
+  };
+  return { client, requests, viewerId, unfollowed, freshPageLoads: () => freshPageLoads };
 }
 
 export function accounts(...pks: string[]): FakeAccount[] {

@@ -56,7 +56,7 @@ describe('collect: happy path', () => {
     const result = await promise;
     const sweeps = fake.requests.filter(r => r.path.endsWith('/show_many/'));
     expect(sweeps).toHaveLength(1);
-    expect(sweeps[0]!.body).toBe('user_ids=1');
+    expect(new URLSearchParams(sweeps[0]!.body ?? '').get('user_ids')).toBe('1');
     expect(result.stats.sweepChecked).toBe(1);
   });
 
@@ -327,7 +327,7 @@ describe('collect: verifying changes against the previous snapshot', () => {
     );
     await promise;
     const bodies = fake.requests.filter(r => r.path.endsWith('/show_many/')).map(r => r.body);
-    expect(bodies).toEqual(['user_ids=1']);
+    expect(bodies.map(body => new URLSearchParams(body ?? '').get('user_ids'))).toEqual(['1']);
   });
 });
 
@@ -423,7 +423,8 @@ describe('collect: when friendship checks are refused', () => {
     const result = await promise;
     expect(result.outcome).toBe('completed');
     expect(result.stats.bulkCheckUnavailable).toBe(true);
-    expect(fake.requests.filter(r => r.path.endsWith('/show_many/'))).toHaveLength(1);
+    // One request, plus its single retry with a fresh page token.
+    expect(fake.requests.filter(r => r.path.endsWith('/show_many/'))).toHaveLength(2);
     expect(sorted(result.followerIds)).toEqual(['2']);
   });
 

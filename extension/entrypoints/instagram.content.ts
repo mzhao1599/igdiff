@@ -5,8 +5,8 @@ import { collect, type CollectionProgress } from '../lib/collector/collect';
 import { runProbe } from '../lib/collector/probe';
 import { installDevBridge } from '../lib/devBridge';
 import { BUILD_ID, DIAGNOSTICS_ENABLED } from '../lib/env';
-import type { InstagramClient } from '../lib/instagram/api';
-import { readSession, readWebClientHeaders } from '../lib/instagram/session';
+import { INSTAGRAM_ORIGIN, type InstagramClient } from '../lib/instagram/api';
+import { buildWebClient, parsePageConfig, randomPageId, readSession, type PageConfig } from '../lib/instagram/session';
 import {
   broadcast,
   handleMessages,
@@ -19,8 +19,10 @@ import {
 const HEARTBEAT_MS = 5_000;
 /** Let Instagram finish loading before offering to sync. */
 const READY_DELAY_MS = 10_000;
-/** Value the Instagram web client has sent as X-ASBD-ID; not read from the page (it isn't exposed there). */
+/** The web app's X-ASBD-ID (its BDHeaderConfig module); not in the page's HTML. */
 const WEB_ASBD_ID = '359341';
+/** Fetch a fresh copy of Instagram's page for a new request token at most this often. */
+const FRESH_PAGE_MIN_INTERVAL_MS = 5 * 60_000;
 
 /**
  * Runs on www.instagram.com only. Collection has to happen here: requests made
@@ -32,19 +34,44 @@ export default defineContentScript({
   matches: ['https://www.instagram.com/*'],
   runAt: 'document_idle',
   main(ctx) {
-    // The page's HTML is large; read Instagram's revision from it once, lazily, on the first write.
-    let pageHtml: string | null = null;
+    // The page's HTML is large; read Instagram's request token and revision from it once, on the first POST.
+    let pageConfig: PageConfig | null = null;
+    let freshPageAt = 0;
+    const pageId = randomPageId();
     // Firefox runs content-script fetch() as the extension; content.fetch() runs it as the page,
     // with the page's cookies, which is what these requests need. Chrome's fetch already does.
     const pageFetch: typeof fetch =
       (globalThis as { content?: { fetch?: typeof fetch } }).content?.fetch?.bind(
         (globalThis as { content?: object }).content,
       ) ?? window.fetch.bind(window);
+    const loadPageConfig = async (fresh: boolean): Promise<PageConfig> => {
+      // A tab open for days can hold an expired token; a newly loaded page has a current one.
+      if (fresh && Date.now() - freshPageAt > FRESH_PAGE_MIN_INTERVAL_MS) {
+        freshPageAt = Date.now();
+        try {
+          const next = parsePageConfig(await (await pageFetch(`${INSTAGRAM_ORIGIN}/`, { credentials: 'include' })).text());
+          if (next.dtsg) {
+            pageConfig = next;
+          }
+        } catch {
+          // Keep the page's own values.
+        }
+      }
+      return (pageConfig ??= parsePageConfig(document.documentElement.innerHTML));
+    };
     const client: InstagramClient = {
       fetch: (input, init) => pageFetch(input, init),
       csrfToken: () => readSession(document.cookie).csrfToken,
-      webClientHeaders: () =>
-        readWebClientHeaders(window.sessionStorage, () => (pageHtml ??= document.documentElement.innerHTML), WEB_ASBD_ID),
+      webClient: async ({ fresh = false } = {}) =>
+        buildWebClient({
+          page: await loadPageConfig(fresh),
+          csrfToken: readSession(document.cookie).csrfToken,
+          sessionStore: window.sessionStorage,
+          localStore: window.localStorage,
+          asbdId: WEB_ASBD_ID,
+          pageId,
+          now: Date.now(),
+        }),
     };
     let running: AbortController | null = null;
     let lastProgress: CollectionProgress | null = null;

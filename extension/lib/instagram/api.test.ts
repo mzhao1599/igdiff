@@ -212,7 +212,7 @@ describe('fetchFriendshipStatuses', () => {
       friendships: { '3': null },
     });
     const result = await fetchFriendshipStatuses(fake.client, ['1', '2', '3']);
-    expect(fake.requests[0]!.body).toBe('user_ids=1,2,3');
+    expect(new URLSearchParams(fake.requests[0]!.body ?? '').get('user_ids')).toBe('1,2,3');
     expect(result.data?.get('1')).toEqual({ following: false, followedBy: true });
     expect(result.data?.get('2')).toEqual({ following: true, followedBy: false });
     expect(result.data?.has('3')).toBe(false);
@@ -298,22 +298,69 @@ describe('describeListShape list flags', () => {
   });
 });
 
-describe('web client headers', () => {
-  it('are added to the unfollow request only, never to reads', async () => {
-    const seen: Array<{ url: string; headers: Record<string, string> }> = [];
-    const fake = createFakeInstagram({ following: [{ pk: '1' }] });
+describe('POSTs as the web app sends them', () => {
+  function recording(fakeOptions: Parameters<typeof createFakeInstagram>[0] = {}) {
+    const fake = createFakeInstagram({ following: [{ pk: '1' }], ...fakeOptions });
+    const seen: Array<{ method: string; headers: Record<string, string>; body: URLSearchParams }> = [];
     const client: InstagramClient = {
+      ...fake.client,
       fetch: (input, init) => {
-        seen.push({ url: String(input), headers: init?.headers as Record<string, string> });
+        seen.push({
+          method: init?.method ?? 'GET',
+          headers: init?.headers as Record<string, string>,
+          body: new URLSearchParams(typeof init?.body === 'string' ? init.body : ''),
+        });
         return fake.client.fetch(input, init);
       },
-      csrfToken: () => 'csrf',
-      webClientHeaders: () => ({ 'x-ig-www-claim': 'claim', 'x-asbd-id': '1' }),
     };
+    return { fake, client, seen };
+  }
+
+  it('carry the page token, checksum and web headers; reads carry none of them', async () => {
+    const { client, seen } = recording();
     await fetchListPage(client, '1000', 'following');
-    await unfollowUser(client, '1', 'destroy');
-    const [read, write] = seen;
+    await fetchFriendshipStatuses(client, ['1']);
+    const unfollow = await unfollowUser(client, '1');
+    expect(unfollow.data).toEqual({ following: false });
+    const [read, bulk, write] = seen;
     expect(read?.headers['x-ig-www-claim']).toBeUndefined();
-    expect(write?.headers).toMatchObject({ 'x-ig-www-claim': 'claim', 'x-asbd-id': '1', 'x-csrftoken': 'csrf' });
+    for (const post of [bulk, write]) {
+      expect(post?.headers).toMatchObject({ 'x-ig-www-claim': '0', 'x-csrftoken': 'csrf-test' });
+      expect(post?.body.get('fb_dtsg')).toBe('dtsg-current');
+      expect(post?.body.get('jazoest')).toMatch(/^2\d+$/);
+    }
+    expect(Object.fromEntries(write!.body)).toMatchObject({ container_module: 'profile', user_id: '1' });
+  });
+
+  it('retry once with a fresh page token when Instagram answers with its app page', async () => {
+    const { fake, client, seen } = recording({ pageToken: 'expired' });
+    const result = await unfollowUser(client, '1');
+    expect(result.data).toEqual({ following: false });
+    expect(seen.map(request => request.body.get('fb_dtsg'))).toEqual(['dtsg-expired', 'dtsg-current']);
+    expect(fake.freshPageLoads()).toBe(1);
+    expect(fake.unfollowed).toEqual(['1']);
+  });
+
+  it('are refused, without a retry, when there is no page to read a token from', async () => {
+    const { fake, client, seen } = recording({ pageToken: 'none' });
+    const result = await unfollowUser(client, '1');
+    expect(result.status).toBe(STATUS_SOFT_BLOCK);
+    expect(result.response?.bodyKind).toBe('html');
+    expect(seen).toHaveLength(1);
+    expect(fake.unfollowed).toEqual([]);
+  });
+
+  it('still send when reading the page values fails', async () => {
+    const { client, seen } = recording();
+    const result = await unfollowUser(
+      {
+        ...client,
+        webClient: () => Promise.reject(new Error('no page')),
+      },
+      '1',
+    );
+    expect(result.status).toBe(STATUS_SOFT_BLOCK);
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen[0]?.body.get('user_id')).toBe('1');
   });
 });

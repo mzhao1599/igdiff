@@ -479,7 +479,6 @@ export default defineBackground(() => {
         status: finished ? 'finished' : 'paused',
         outcome: result.outcome,
         message: result.message,
-        endpoint: result.endpoint ?? job.endpoint ?? null,
         updatedAt: now,
       });
       broadcast({ type: 'unfollow:changed' });
