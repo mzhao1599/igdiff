@@ -196,6 +196,61 @@ describe('runUnfollows', () => {
     expect((await promise).results[0]?.outcome).toBe('failed');
   });
 
+  it('removes followers with the same pacing and checks, and verifies they are gone', async () => {
+    const { promise, fake, sleeps } = run({ followers: accounts('1', '2', '3') }, ['1', '3'], { kind: 'remove_follower' });
+    const result = await promise;
+    expect(result.outcome).toBe('completed');
+    expect(fake.removedFollowers).toEqual(['1', '3']);
+    expect(fake.unfollowed).toEqual([]);
+    expect(result.results.map(r => [r.pk, r.outcome])).toEqual([
+      ['1', 'removed'],
+      ['3', 'removed'],
+    ]);
+    expect(sleeps).toHaveLength(1);
+  });
+
+  it('fails a removal if the account still follows you afterwards', async () => {
+    const { promise } = run(
+      {
+        followers: accounts('1'),
+        intercept: r => (r.method === 'POST' ? json({ status: 'ok' }) : undefined),
+        friendships: { '1': { following: false, followed_by: true } },
+      },
+      ['1'],
+      { kind: 'remove_follower' },
+    );
+    const result = await promise;
+    expect(result.results[0]).toMatchObject({ pk: '1', outcome: 'failed' });
+    expect(result.results[0]?.detail).toMatch(/still follows you/);
+  });
+
+  it('follows back, counting a request to a private account as done', async () => {
+    const { promise, fake } = run({ followers: accounts('1', '2'), privateAccounts: ['2'] }, ['1', '2'], { kind: 'follow' });
+    const result = await promise;
+    expect(result.outcome).toBe('completed');
+    expect(result.results.map(r => [r.pk, r.outcome])).toEqual([
+      ['1', 'followed'],
+      ['2', 'requested'],
+    ]);
+    expect(fake.followed).toEqual(['1']);
+    expect(fake.requested).toEqual(['2']);
+  });
+
+  it('fails a follow Instagram did not make, such as one it wants confirmed first', async () => {
+    const { promise } = run(
+      {
+        followers: accounts('1'),
+        intercept: r =>
+          r.method === 'POST' ? json({ friendship_status: { following: false, outgoing_request: false }, status: 'ok' }) : undefined,
+      },
+      ['1'],
+      { kind: 'follow' },
+    );
+    const result = await promise;
+    expect(result.results[0]).toMatchObject({ pk: '1', outcome: 'failed' });
+    expect(result.results[0]?.detail).toMatch(/confirm/);
+  });
+
   it('does nothing without a signed-in account, and ignores duplicates', async () => {
     const none = await run({ following: accounts('1') }, ['1'], { viewerId: null }).promise;
     expect(none.outcome).toBe('no_session');

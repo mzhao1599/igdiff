@@ -1,5 +1,5 @@
 {
-  "name": "follower-tracker",
+  "name": "igdiff",
   "private": true,
   "version": "0.1.0",
   "description": "Local-only follower tracker for Instagram: who doesn't follow back, mutuals, and who unfollowed you.",

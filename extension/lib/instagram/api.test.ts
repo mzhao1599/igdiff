@@ -8,7 +8,9 @@ import {
   fetchFriendshipStatuses,
   fetchListPage,
   fetchProfile,
+  followUser,
   normalizeUser,
+  removeFollower,
   parseFollowedBy,
   parseNextMaxId,
   parseRankToken,
@@ -254,7 +256,7 @@ describe('fetchFriendshipStatus', () => {
     const fake = createFakeInstagram({ followers: [{ pk: '7' }] });
     const result = await fetchFriendshipStatus(fake.client, '7');
     expect(fake.requests[0]!.path).toBe('/api/v1/friendships/show/7/');
-    expect(result.data).toEqual({ following: false, followedBy: true });
+    expect(result.data).toEqual({ following: false, followedBy: true, outgoingRequest: false });
   });
 
   it('reads nested friendship_status too', async () => {
@@ -262,7 +264,7 @@ describe('fetchFriendshipStatus', () => {
       intercept: () => json({ friendship_status: { following: true, followed_by: false }, status: 'ok' }),
     });
     const result = await fetchFriendshipStatus(fake.client, '7');
-    expect(result.data).toEqual({ following: true, followedBy: false });
+    expect(result.data).toEqual({ following: true, followedBy: false, outgoingRequest: null });
   });
 
   it('returns no data for an account Instagram does not know', async () => {
@@ -321,7 +323,7 @@ describe('POSTs as the web app sends them', () => {
     await fetchListPage(client, '1000', 'following');
     await fetchFriendshipStatuses(client, ['1']);
     const unfollow = await unfollowUser(client, '1');
-    expect(unfollow.data).toEqual({ following: false });
+    expect(unfollow.data).toEqual({ following: false, followedBy: null, outgoingRequest: null });
     const [read, bulk, write] = seen;
     expect(read?.headers['x-ig-www-claim']).toBeUndefined();
     for (const post of [bulk, write]) {
@@ -335,10 +337,28 @@ describe('POSTs as the web app sends them', () => {
   it('retry once with a fresh page token when Instagram answers with its app page', async () => {
     const { fake, client, seen } = recording({ pageToken: 'expired' });
     const result = await unfollowUser(client, '1');
-    expect(result.data).toEqual({ following: false });
+    expect(result.data).toEqual({ following: false, followedBy: null, outgoingRequest: null });
     expect(seen.map(request => request.body.get('fb_dtsg'))).toEqual(['dtsg-expired', 'dtsg-current']);
     expect(fake.freshPageLoads()).toBe(1);
     expect(fake.unfollowed).toEqual(['1']);
+  });
+
+  it('follow with the web app\'s request, leaving Instagram\'s own checks on', async () => {
+    const { fake, client, seen } = recording({ followers: [{ pk: '7' }, { pk: '8' }], privateAccounts: ['8'] });
+    expect((await followUser(client, '7')).data).toMatchObject({ following: true, outgoingRequest: false });
+    expect((await followUser(client, '8')).data).toMatchObject({ following: false, outgoingRequest: true });
+    expect(Object.fromEntries(seen[0]!.body)).toMatchObject({ user_id: '7', include_follow_friction_check: 'true' });
+    expect(fake.followed).toEqual(['7']);
+    expect(fake.requested).toEqual(['8']);
+  });
+
+  it('remove a follower with the web app\'s request', async () => {
+    const { fake, client, seen } = recording({ followers: [{ pk: '7' }] });
+    const result = await removeFollower(client, '7');
+    expect(result.data).toEqual({ following: null, followedBy: false, outgoingRequest: null });
+    expect(fake.removedFollowers).toEqual(['7']);
+    expect(seen[0]?.body.get('fb_dtsg')).toBe('dtsg-current');
+    expect((await removeFollower(client, 'nobody')).status).toBe(404);
   });
 
   it('are refused, without a retry, when there is no page to read a token from', async () => {

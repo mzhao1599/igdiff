@@ -26,12 +26,13 @@ import type {
   ResumeState,
   Verification,
 } from '../collector/collect';
+import type { AvatarRecord } from '../avatars';
 import type { IgUser, ListKind } from '../instagram/api';
 import { DEFAULT_COMMIT_GUARD, planCommit, type CommitGuard, type RejectReason, type TrackerEventType } from './commit';
 import type { FollowSets } from './diff';
 
 export const DB_NAME = 'follower-tracker';
-const DB_VERSION = 3;
+const DB_VERSION = 4;
 /** Snapshots whose full id lists are kept. Older ones keep counts only. */
 export const KEEP_LISTS_FOR_SNAPSHOTS = 3;
 
@@ -46,8 +47,11 @@ export interface AccountRecord {
 
 export interface DiffCounts {
   readonly followersGained: number;
+  /** Includes followers the user removed (`followersRemovedByYou`). */
   readonly followersLost: number;
   readonly followersLostConfirmed: number;
+  /** Absent on snapshots saved before removing followers existed. */
+  readonly followersRemovedByYou?: number;
   readonly followingAdded: number;
   readonly followingRemoved: number;
 }
@@ -148,13 +152,13 @@ export interface KeepRecord {
   readonly addedAt: number;
 }
 
-export type ActionOutcome = 'unfollowed' | 'not_found' | 'failed';
+export type ActionOutcome = 'unfollowed' | 'removed' | 'followed' | 'requested' | 'not_found' | 'failed';
 
 export interface ActionRecord {
   readonly id: number;
   readonly viewerId: string;
   readonly pk: string;
-  readonly type: 'unfollow';
+  readonly type: 'unfollow' | 'remove_follower' | 'follow';
   readonly outcome: ActionOutcome;
   readonly detail: string | null;
   readonly at: number;
@@ -176,6 +180,7 @@ interface TrackerSchema extends DBSchema {
   };
   keep: { key: [string, string]; value: KeepRecord; indexes: { byViewer: string } };
   actions: { key: number; value: WithoutId<ActionRecord>; indexes: { byViewer: [string, number] } };
+  avatars: { key: [string, string]; value: AvatarRecord; indexes: { byViewer: string } };
 }
 
 type StoreName = 'accounts' | 'snapshots' | 'snapshotLists' | 'profiles' | 'events';
@@ -229,6 +234,9 @@ export class TrackerStore {
           database.createObjectStore('keep', { keyPath: ['viewerId', 'pk'] }).createIndex('byViewer', 'viewerId');
           const actions = database.createObjectStore('actions', { keyPath: 'id', autoIncrement: true });
           actions.createIndex('byViewer', ['viewerId', 'at']);
+        }
+        if (oldVersion < 4) {
+          database.createObjectStore('avatars', { keyPath: ['viewerId', 'pk'] }).createIndex('byViewer', 'viewerId');
         }
       },
     });
@@ -300,7 +308,11 @@ export class TrackerStore {
    * since the previous one. Incomplete or suspicious results are rejected and
    * leave the store untouched.
    */
-  async commit(result: CollectionResult, guard: CommitGuard = DEFAULT_COMMIT_GUARD): Promise<CommitOutcome> {
+  async commit(
+    result: CollectionResult,
+    guard: CommitGuard = DEFAULT_COMMIT_GUARD,
+    removedByYou: ReadonlySet<string> = new Set(),
+  ): Promise<CommitOutcome> {
     const viewerId = result.viewerId;
     if (!viewerId) {
       const plan = planCommit(null, result, guard);
@@ -311,7 +323,7 @@ export class TrackerStore {
 
     const tx = this.db.transaction(ALL_STORES, 'readwrite');
     const previous = await readLatest(tx, viewerId);
-    const plan = planCommit(previous, result, guard);
+    const plan = planCommit(previous, result, guard, removedByYou);
     if (plan.kind === 'rejected') {
       await tx.done;
       return { status: 'rejected', reason: plan.reason, detail: plan.detail };
@@ -325,6 +337,7 @@ export class TrackerStore {
           followersLostConfirmed: plan.events.filter(
             event => event.type === 'follower_lost' && event.verification === 'confirmed',
           ).length,
+          followersRemovedByYou: plan.events.filter(event => event.type === 'follower_removed').length,
           followingAdded: plan.diff.followingAdded.length,
           followingRemoved: plan.diff.followingRemoved.length,
         }
@@ -516,6 +529,24 @@ export class TrackerStore {
     await tx.done;
   }
 
+  async getAvatars(viewerId: string, pks: readonly string[]): Promise<Map<string, AvatarRecord>> {
+    const store = this.db.transaction('avatars').store;
+    const records = await Promise.all(pks.map(pk => store.get([viewerId, pk])));
+    const out = new Map<string, AvatarRecord>();
+    records.forEach(record => {
+      if (record) {
+        out.set(record.pk, record);
+      }
+    });
+    return out;
+  }
+
+  async putAvatars(records: readonly AvatarRecord[]): Promise<void> {
+    const tx = this.db.transaction('avatars', 'readwrite');
+    await Promise.all(records.map(record => tx.store.put(record)));
+    await tx.done;
+  }
+
   async listKeep(viewerId: string): Promise<Set<string>> {
     const records = await this.db.getAllFromIndex('keep', 'byViewer', viewerId);
     return new Set(records.map(record => record.pk));
@@ -549,12 +580,14 @@ export class TrackerStore {
 
   async deleteAccount(viewerId: string): Promise<void> {
     await this.clearCheckpoint(viewerId);
-    const actionsTx = this.db.transaction(['keep', 'actions'], 'readwrite');
+    const actionsTx = this.db.transaction(['keep', 'actions', 'avatars'], 'readwrite');
     const keepKeys = await actionsTx.objectStore('keep').index('byViewer').getAllKeys(viewerId);
     const actionKeys = await actionsTx.objectStore('actions').index('byViewer').getAllKeys(viewerTimeRange(viewerId));
+    const avatarKeys = await actionsTx.objectStore('avatars').index('byViewer').getAllKeys(viewerId);
     await Promise.all([
       ...keepKeys.map(key => actionsTx.objectStore('keep').delete(key)),
       ...actionKeys.map(key => actionsTx.objectStore('actions').delete(key)),
+      ...avatarKeys.map(key => actionsTx.objectStore('avatars').delete(key)),
     ]);
     await actionsTx.done;
     const tx = this.db.transaction(ALL_STORES, 'readwrite');

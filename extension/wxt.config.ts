@@ -25,23 +25,22 @@ export default defineConfig({
     disabled: true,
   },
   manifest: ({ mode, browser }) => ({
-    name: mode === 'production' ? 'Follower Tracker' : 'Follower Tracker (dev)',
+    name: mode === 'production' ? 'IgDiff' : 'IgDiff (dev)',
     description:
-      'See who does not follow you back, your mutuals, and who unfollowed you. Runs locally in your browser.',
+      "See who doesn't follow you back, who unfollowed you, and your mutuals on Instagram. Automatic, private, all in your browser.",
     // unlimitedStorage keeps snapshot history from being evicted under disk pressure;
     // storage holds scheduler state; alarms re-checks long-lived Instagram tabs.
     permissions: ['unlimitedStorage', 'storage', 'alarms'],
     host_permissions: ['https://www.instagram.com/*'],
     action: {
-      default_title: 'Follower Tracker',
+      default_title: 'IgDiff',
       default_icon: { 16: 'icon/16.png', 32: 'icon/32.png', 48: 'icon/48.png' },
     },
     ...(browser === 'firefox'
       ? {
           browser_specific_settings: {
             gecko: {
-              // Placeholder until the final name is chosen.
-              id: 'follower-tracker@extension',
+              id: 'igdiff@extension',
               strict_min_version: '115.0',
               // Nothing leaves the user's device except requests to Instagram itself.
               data_collection_permissions: { required: ['none'] },

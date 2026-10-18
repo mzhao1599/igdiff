@@ -3,33 +3,97 @@
  * without a browser.
  */
 import { DEFAULT_UNFOLLOW_SETTINGS, type UnfollowSettings } from '../actions/unfollow';
-import type { Relationships } from '../tracker/diff';
-import type { ActionRecord, EventRecord, ProfileRecord } from '../tracker/store';
+import { computeRelationships, type FollowSets } from '../tracker/diff';
+import type { ActionRecord, EventRecord, ProfileRecord, SnapshotRecord } from '../tracker/store';
 
 export interface PanelLists {
-  /** You follow them, they don't follow back, and you haven't unfollowed them here since the last sync. */
+  readonly followers: readonly string[];
+  readonly following: readonly string[];
+  /** You follow them and they don't follow you. */
   readonly notFollowingBack: readonly string[];
   readonly fans: readonly string[];
   readonly mutuals: readonly string[];
 }
 
 /**
- * Accounts the extension unfollowed after the latest snapshot drop out right
- * away; the next sync then records them as "You unfollowed". Anything that
- * failed or was skipped stays listed, so nothing looks done that isn't.
+ * The lists as of the latest snapshot, plus what IgDiff did since: accounts
+ * unfollowed, removed or followed back here change lists right away (a mutual
+ * you unfollowed becomes a fan, a fan you followed back becomes a mutual),
+ * before the next sync records it. Follow requests to private accounts change
+ * nothing until they're approved. Anything that failed or was skipped stays
+ * where it was, so nothing looks done that isn't.
  */
-export function panelLists(
-  relationships: Relationships,
-  actionsSinceSnapshot: readonly ActionRecord[],
-): PanelLists {
-  const handled = new Set(
-    actionsSinceSnapshot.filter(action => action.outcome === 'unfollowed').map(action => action.pk),
-  );
+export function panelLists(sets: FollowSets, actionsSinceSnapshot: readonly ActionRecord[]): PanelLists {
+  const done = (type: ActionRecord['type'], outcome: ActionRecord['outcome']) =>
+    new Set(actionsSinceSnapshot.filter(action => action.type === type && action.outcome === outcome).map(action => action.pk));
+  const unfollowed = done('unfollow', 'unfollowed');
+  const removed = done('remove_follower', 'removed');
+  const followed = done('follow', 'followed');
+  const followers = sets.followerIds.filter(pk => !removed.has(pk));
+  const already = new Set(sets.followingIds);
+  // Newest first, like Instagram's own order.
+  const following = [
+    ...[...followed].filter(pk => !already.has(pk) && !unfollowed.has(pk)),
+    ...sets.followingIds.filter(pk => !unfollowed.has(pk)),
+  ];
+  return { followers, following, ...computeRelationships({ followerIds: followers, followingIds: following }) };
+}
+
+export type SortOrder = 'recent' | 'oldest' | 'az';
+
+/**
+ * `recent` keeps Instagram's order: most recently followed first for lists
+ * built from your following (don't follow back, mutuals), Instagram's own
+ * order (in practice newest first) for followers and fans.
+ */
+export function sortAccounts(
+  pks: readonly string[],
+  order: SortOrder,
+  profiles: ReadonlyMap<string, ProfileRecord>,
+): readonly string[] {
+  if (order === 'oldest') {
+    return [...pks].reverse();
+  }
+  if (order === 'az') {
+    const name = (pk: string) => profiles.get(pk)?.username ?? '';
+    return [...pks].sort((a, b) => name(a).localeCompare(name(b)));
+  }
+  return pks;
+}
+
+/** Followers gained and lost in the last `days` days. Removed followers don't count as lost. */
+export function followerDiff(events: readonly EventRecord[], now: number, days = 7): { gained: number; lost: number } {
+  const since = now - days * 86_400_000;
+  const recent = events.filter(event => event.detectedAt >= since);
   return {
-    notFollowingBack: relationships.notFollowingBack.filter(pk => !handled.has(pk)),
-    fans: relationships.fans,
-    mutuals: relationships.mutuals.filter(pk => !handled.has(pk)),
+    gained: recent.filter(event => event.type === 'follower_gained').length,
+    lost: recent.filter(event => event.type === 'follower_lost').length,
   };
+}
+
+/** Oldest-first follower and following counts, one point per snapshot. */
+export function countSeries(
+  snapshots: readonly SnapshotRecord[],
+): Array<{ at: number; followers: number; following: number }> {
+  return [...snapshots]
+    .sort((a, b) => a.takenAt - b.takenAt)
+    .map(snapshot => ({ at: snapshot.takenAt, followers: snapshot.followerCount, following: snapshot.followingCount }));
+}
+
+/** An SVG path through `values`, scaled to fill `width` x `height` (flat line for a single value). */
+export function linePath(values: readonly number[], width: number, height: number, pad = 2): string {
+  if (values.length === 0) {
+    return '';
+  }
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const span = max - min || 1;
+  const x = (i: number) => (values.length === 1 ? width / 2 : pad + (i * (width - 2 * pad)) / (values.length - 1));
+  const y = (value: number) => (max === min ? height / 2 : pad + ((max - value) * (height - 2 * pad)) / span);
+  if (values.length === 1) {
+    return `M${pad},${y(values[0]!)}H${width - pad}`;
+  }
+  return values.map((value, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)},${y(value).toFixed(1)}`).join('');
 }
 
 export function matchesSearch(profile: ProfileRecord | undefined, query: string): boolean {

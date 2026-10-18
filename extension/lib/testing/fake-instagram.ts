@@ -55,6 +55,8 @@ export interface FakeInstagramOptions {
   readonly destroyGone?: boolean;
   /** The unfollow endpoint answers with a bare JSON 404, as seen on a real account for a request without the page token. */
   readonly destroy404?: boolean;
+  /** Accounts whose follows become requests, like private accounts. */
+  readonly privateAccounts?: readonly string[];
   /** Overrides for show_many. `null` leaves an account out of the response (deactivated/unavailable). */
   readonly friendships?: Readonly<Record<string, { following?: boolean; followed_by?: boolean } | null>>;
   /** Return a Response to replace the default answer for a request. */
@@ -93,6 +95,9 @@ export function createFakeInstagram(options: FakeInstagramOptions = {}) {
   const requests: FakeRequest[] = [];
   const counts = new Map<string, number>();
   const unfollowed: string[] = [];
+  const removedFollowers: string[] = [];
+  const followed: string[] = [];
+  const requested: string[] = [];
   let freshPageLoads = 0;
 
   const page = (
@@ -174,6 +179,25 @@ export function createFakeInstagram(options: FakeInstagramOptions = {}) {
       unfollowed.push(id);
       return json({ friendship_status: { following: false }, status: 'ok' });
     }
+    const create = /^\/api\/v1\/friendships\/create\/([^/]+)\/$/.exec(url.pathname);
+    if (create && method === 'POST') {
+      const id = decodeURIComponent(create[1]!);
+      if (![...followers, ...following].some(account => account.pk === id)) {
+        return json({ message: 'User not found', status: 'fail' }, 404);
+      }
+      const isPrivate = options.privateAccounts?.includes(id) ?? false;
+      (isPrivate ? requested : followed).push(id);
+      return json({ friendship_status: { following: !isPrivate, outgoing_request: isPrivate }, status: 'ok' });
+    }
+    const remove = /^\/api\/v1\/friendships\/remove_follower\/([^/]+)\/$/.exec(url.pathname);
+    if (remove && method === 'POST') {
+      const id = decodeURIComponent(remove[1]!);
+      if (!followers.some(account => account.pk === id)) {
+        return json({ message: 'User not found', status: 'fail' }, 404);
+      }
+      removedFollowers.push(id);
+      return json({ friendship_status: { followed_by: false }, status: 'ok' });
+    }
     const single = /^\/api\/v1\/friendships\/show\/([^/]+)\/$/.exec(url.pathname);
     if (single && method === 'GET') {
       const id = decodeURIComponent(single[1]!);
@@ -183,8 +207,9 @@ export function createFakeInstagram(options: FakeInstagramOptions = {}) {
       }
       return json({
         ...(override ?? {
-          following: following.some(account => account.pk === id) && !unfollowed.includes(id),
-          followed_by: followers.some(account => account.pk === id),
+          following: (following.some(account => account.pk === id) && !unfollowed.includes(id)) || followed.includes(id),
+          followed_by: followers.some(account => account.pk === id) && !removedFollowers.includes(id),
+          outgoing_request: requested.includes(id),
         }),
         status: 'ok',
       });
@@ -223,7 +248,7 @@ export function createFakeInstagram(options: FakeInstagramOptions = {}) {
           },
         }),
   };
-  return { client, requests, viewerId, unfollowed, freshPageLoads: () => freshPageLoads };
+  return { client, requests, viewerId, unfollowed, removedFollowers, followed, requested, freshPageLoads: () => freshPageLoads };
 }
 
 export function accounts(...pks: string[]): FakeAccount[] {

@@ -12,6 +12,19 @@ describe('planCommit', () => {
     }
   });
 
+  it('records followers the user removed as "You removed", never as a suspicious loss', () => {
+    const previous = { followerIds: range(0, 100), followingIds: [] };
+    // 40 of 100 followers gone, unverified: suspicious, unless the user removed them.
+    const result = makeResult({ followerIds: range(40, 100), followingIds: [] });
+    expect(planCommit(previous, result).kind).toBe('rejected');
+    const plan = planCommit(previous, result, undefined, new Set(range(0, 40)));
+    expect(plan.kind).toBe('accepted');
+    if (plan.kind === 'accepted') {
+      expect(plan.events.every(event => event.type === 'follower_removed')).toBe(true);
+      expect(plan.events).toHaveLength(40);
+    }
+  });
+
   it('rejects a result without a viewer', () => {
     expect(planCommit(null, makeResult({ viewerId: null })).kind).toBe('rejected');
   });

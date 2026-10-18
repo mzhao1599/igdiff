@@ -1,5 +1,6 @@
 /**
- * Unfollows a user-chosen list of accounts, one at a time, slowly.
+ * Unfollows, removes as followers, or follows back a user-chosen list of
+ * accounts, one at a time, slowly.
  *
  * This changes the user's account, so it is deliberately conservative:
  *   - only the accounts passed in, never more than `maxUnfollows`;
@@ -8,11 +9,11 @@
  *     a sign-in or challenge page) stops the whole run;
  *   - an account that no longer exists is skipped, not retried.
  *
- * Success requires a JSON `ok` from Instagram, `following: false` when it
+ * Success requires a JSON `ok` from Instagram, the follow reported off when it
  * reports the friendship state, and then a read-only friendship check showing
  * the follow is really gone. An HTML page with status 200 is never a success.
  *
- * Until Instagram has accepted one unfollow in a run, a refusal says the
+ * Until Instagram has accepted one action in a run, a refusal says the
  * request is wrong, not the account (Instagram has answered a malformed request
  * with a bare 404 on a real account): the run stops with Instagram's answer and
  * the queue intact rather than skipping through the selection.
@@ -20,13 +21,66 @@
 import { abortableSleep, classifyFailure, describeStatus } from '../collector/collect';
 import {
   fetchFriendshipStatus,
+  followUser,
   isOkStatus,
+  removeFollower,
   STATUS_SOFT_BLOCK,
   unfollowUser,
   type ApiResult,
+  type FriendshipFlags,
   type InstagramClient,
-  type UnfollowAnswer,
 } from '../instagram/api';
+
+/** What a run does to each account. */
+export type ActionKind = 'unfollow' | 'remove_follower' | 'follow';
+
+type DoneOutcome = 'unfollowed' | 'removed' | 'followed' | 'requested';
+
+interface ActionSpec {
+  readonly run: (client: InstagramClient, pk: string) => Promise<ApiResult<FriendshipFlags>>;
+  /** The friendship says the action didn't happen. Unknown flags (`null`) don't count. */
+  readonly notDone: (flags: FriendshipFlags) => boolean;
+  readonly outcome: (flags: FriendshipFlags) => DoneOutcome;
+  readonly doing: string;
+  readonly past: string;
+  readonly request: string;
+  readonly stillReported: string;
+  readonly stillAfterCheck: string;
+}
+
+const ACTIONS: Record<ActionKind, ActionSpec> = {
+  unfollow: {
+    run: unfollowUser,
+    notDone: flags => flags.following === true,
+    outcome: () => 'unfollowed',
+    doing: 'Unfollowing',
+    past: 'unfollowed',
+    request: 'unfollow',
+    stillReported: 'Instagram still reports you follow this account.',
+    stillAfterCheck: 'Instagram answered ok, but you still follow this account.',
+  },
+  remove_follower: {
+    run: removeFollower,
+    notDone: flags => flags.followedBy === true,
+    outcome: () => 'removed',
+    doing: 'Removing followers',
+    past: 'removed',
+    request: 'remove',
+    stillReported: 'Instagram still reports this account follows you.',
+    stillAfterCheck: 'Instagram answered ok, but this account still follows you.',
+  },
+  follow: {
+    run: followUser,
+    notDone: flags => flags.following === false && flags.outgoingRequest !== true,
+    // A private account gets a request it has to approve.
+    outcome: flags => (flags.following !== true && flags.outgoingRequest === true ? 'requested' : 'followed'),
+    doing: 'Following back',
+    past: 'followed',
+    request: 'follow',
+    stillReported: "Instagram didn't follow this account. It may want you to confirm this one on Instagram.",
+    stillAfterCheck: "Instagram answered ok, but you don't follow this account.",
+  },
+};
 
 export interface UnfollowSettings {
   readonly delayMs: number;
@@ -48,7 +102,12 @@ export const DEFAULT_UNFOLLOW_SETTINGS: UnfollowSettings = {
   verify: true,
 };
 
-export type UnfollowItemOutcome = 'unfollowed' | 'not_found' | 'failed';
+export type UnfollowItemOutcome = DoneOutcome | 'not_found' | 'failed';
+
+/** The outcome means the action happened (unfollowed, removed, followed, or a follow request sent). */
+export function isDone(outcome: UnfollowItemOutcome): boolean {
+  return outcome !== 'not_found' && outcome !== 'failed';
+}
 
 export interface UnfollowItemResult {
   readonly pk: string;
@@ -62,6 +121,7 @@ export type UnfollowRunOutcome = 'completed' | 'stopped' | 'blocked' | 'limit' |
 export interface UnfollowProgress {
   readonly total: number;
   readonly done: number;
+  /** Accounts the action succeeded for (unfollowed, removed or followed). */
   readonly unfollowed: number;
   readonly current: string | null;
   readonly waiting: { readonly reason: 'pacing' | 'pause' | 'retry'; readonly ms: number; readonly endsAt: number } | null;
@@ -76,6 +136,8 @@ export interface UnfollowRunResult {
 }
 
 export interface UnfollowOptions {
+  /** Defaults to unfollowing. */
+  readonly kind?: ActionKind;
   readonly client: InstagramClient;
   readonly viewerId: string | null;
   readonly pks: readonly string[];
@@ -98,14 +160,14 @@ class RunStop extends Error {
   }
 }
 
-function describeAnswer(result: ApiResult<UnfollowAnswer>): string {
+function describeAnswer(result: ApiResult<FriendshipFlags>): string {
   const message = result.failure?.message ? ` "${result.failure.message}"` : '';
   const body = result.response ? ` (${result.response.bodyKind})` : '';
   return `${describeStatus(result.status)}${message}${body}`;
 }
 
 /** Instagram refused the request itself, not this account: HTML app page, empty body, 404/405 without JSON. */
-function requestRefused(result: ApiResult<UnfollowAnswer>): boolean {
+function requestRefused(result: ApiResult<FriendshipFlags>): boolean {
   const kind = result.response?.bodyKind;
   const notJson = kind === 'html' || kind === 'empty' || kind === 'text';
   return (
@@ -120,6 +182,7 @@ export async function runUnfollows(options: UnfollowOptions): Promise<UnfollowRu
   const random = options.random ?? Math.random;
   const now = options.now ?? Date.now;
   const { client, signal } = options;
+  const action = ACTIONS[options.kind ?? 'unfollow'];
   const queue = Array.from(new Set(options.pks));
   const results: UnfollowItemResult[] = [];
   let unfollowed = 0;
@@ -132,7 +195,7 @@ export async function runUnfollows(options: UnfollowOptions): Promise<UnfollowRu
 
   const checkStopped = () => {
     if (signal?.aborted) {
-      throw new RunStop('stopped', 'Stopped. The accounts not yet unfollowed are still in the queue.');
+      throw new RunStop('stopped', 'Stopped. The rest are still in the queue.');
     }
   };
 
@@ -145,7 +208,7 @@ export async function runUnfollows(options: UnfollowOptions): Promise<UnfollowRu
   const record = (pk: string, outcome: UnfollowItemOutcome, detail: string | null) => {
     const item = { pk, outcome, detail, at: now() };
     results.push(item);
-    if (outcome === 'unfollowed') {
+    if (isDone(outcome)) {
       unfollowed++;
     }
     options.onItem?.(item);
@@ -155,24 +218,28 @@ export async function runUnfollows(options: UnfollowOptions): Promise<UnfollowRu
   async function unfollowOne(pk: string): Promise<void> {
     for (let attempt = 0; ; attempt++) {
       checkStopped();
-      const result = await unfollowUser(client, pk);
+      const result = await action.run(client, pk);
 
       if (isOkStatus(result.status) && result.data) {
         accepted = true;
-        if (result.data.following === true) {
-          record(pk, 'failed', 'Instagram still reports you follow this account.');
+        if (action.notDone(result.data)) {
+          record(pk, 'failed', action.stillReported);
           return;
         }
         if (settings.verify) {
           const check = await fetchFriendshipStatus(client, pk);
-          if (check.data?.following === true) {
-            record(pk, 'failed', 'Instagram answered ok, but you still follow this account.');
+          if (check.data && action.notDone(check.data)) {
+            record(pk, 'failed', action.stillAfterCheck);
             return;
           }
-          record(pk, 'unfollowed', check.data ? null : 'Not double-checked: the friendship check did not answer.');
+          record(
+            pk,
+            action.outcome(check.data ?? result.data),
+            check.data ? null : 'Not double-checked: the friendship check did not answer.',
+          );
           return;
         }
-        record(pk, 'unfollowed', null);
+        record(pk, action.outcome(result.data), null);
         return;
       }
 
@@ -182,17 +249,17 @@ export async function runUnfollows(options: UnfollowOptions): Promise<UnfollowRu
       if (failure?.actionBlocked || failure?.spam) {
         throw new RunStop(
           'blocked',
-          `Instagram blocked unfollowing for now${failure.message ? ` ("${failure.message}")` : ''}. Paused for a day.`,
+          `Instagram blocked this for now${failure.message ? ` ("${failure.message}")` : ''}. Paused for a day.`,
         );
       }
       if (kind === 'auth') {
-        throw new RunStop('blocked', 'Instagram asked to sign in again or finish a security check. Unfollowing stopped.');
+        throw new RunStop('blocked', `Instagram asked to sign in again or finish a security check. ${action.doing} stopped.`);
       }
 
       if (!accepted && (kind === 'fatal' || requestRefused(result))) {
         throw new RunStop(
           'error',
-          `Instagram didn't accept the unfollow request (${detail}). Nothing was unfollowed; the accounts stay queued.`,
+          `Instagram didn't accept the ${action.request} request (${detail}). Nothing was ${action.past}; the accounts stay queued.`,
         );
       }
 
@@ -204,9 +271,9 @@ export async function runUnfollows(options: UnfollowOptions): Promise<UnfollowRu
         continue;
       }
       if (kind === 'transient') {
-        throw new RunStop('error', 'Instagram could not be reached. Unfollowing stopped; try again later.');
+        throw new RunStop('error', `Instagram could not be reached. ${action.doing} stopped; try again later.`);
       }
-      // Unfollowing works, so this refusal is about this one account (deleted, deactivated, not followed).
+      // The action works, so this refusal is about this one account (deleted, deactivated, not followed).
       record(pk, result.status === 404 || result.status === 400 ? 'not_found' : 'failed', detail);
       return;
     }
@@ -221,7 +288,7 @@ export async function runUnfollows(options: UnfollowOptions): Promise<UnfollowRu
     for (; index < queue.length; index++) {
       checkStopped();
       if (unfollowed >= options.maxUnfollows) {
-        throw new RunStop('limit', `Reached today's limit of unfollows. The rest stay queued for tomorrow.`);
+        throw new RunStop('limit', `Reached today's limit. The rest stay queued for tomorrow.`);
       }
       current = queue[index]!;
       emit();

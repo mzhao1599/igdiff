@@ -243,11 +243,27 @@ describe('TrackerStore keep list and actions', () => {
     expect((await store.listActions('A', 150)).map(a => a.pk)).toEqual(['2']);
   });
 
-  it('deleting an account removes its keep list and actions too', async () => {
+  it('deleting an account removes its keep list, actions and pictures too', async () => {
     await store.setKeep('A', ['1'], true, 10);
     await store.recordAction({ viewerId: 'A', pk: '1', type: 'unfollow', outcome: 'unfollowed', detail: null, at: 100 });
+    await store.putAvatars([{ viewerId: 'A', pk: '1', key: 'cdn/1.jpg', dataUrl: 'data:image/jpeg;base64,AQ==', fetchedAt: 1 }]);
     await store.deleteAccount('A');
     expect((await store.listKeep('A')).size).toBe(0);
     expect(await store.listActions('A')).toEqual([]);
+    expect((await store.getAvatars('A', ['1'])).size).toBe(0);
+  });
+});
+
+describe('TrackerStore avatars', () => {
+  it('stores pictures per account and replaces them by pk', async () => {
+    await store.putAvatars([
+      { viewerId: 'A', pk: '1', key: 'cdn/old.jpg', dataUrl: 'data:,old', fetchedAt: 1 },
+      { viewerId: 'B', pk: '1', key: 'cdn/b.jpg', dataUrl: 'data:,b', fetchedAt: 1 },
+    ]);
+    await store.putAvatars([{ viewerId: 'A', pk: '1', key: 'cdn/new.jpg', dataUrl: 'data:,new', fetchedAt: 2 }]);
+    const a = await store.getAvatars('A', ['1', '2']);
+    expect([...a.keys()]).toEqual(['1']);
+    expect(a.get('1')).toMatchObject({ key: 'cdn/new.jpg', dataUrl: 'data:,new' });
+    expect((await store.getAvatars('B', ['1'])).get('1')?.dataUrl).toBe('data:,b');
   });
 });

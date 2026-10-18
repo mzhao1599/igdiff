@@ -19,8 +19,9 @@ import type {
 import type { ProbeReport } from './collector/probe';
 import type { Attempt, AutoSyncDecision } from './scheduler/policy';
 import type { UnfollowAllowance } from './actions/limits';
+import type { AvatarRequest } from './avatars';
 import type { UnfollowJob } from './actions/state';
-import type { UnfollowItemResult, UnfollowProgress, UnfollowRunResult } from './actions/unfollow';
+import type { ActionKind, UnfollowItemResult, UnfollowProgress, UnfollowRunResult } from './actions/unfollow';
 import type { CommitOutcome } from './tracker/store';
 
 // Background → content script (via tabs.sendMessage).
@@ -36,8 +37,16 @@ export type ContentRequest =
       readonly settings?: Partial<CollectorSettings>;
     }
   | { readonly type: 'collector:stop' }
-  | { readonly type: 'unfollow:run'; readonly jobId: string; readonly pks: readonly string[]; readonly maxUnfollows: number }
-  | { readonly type: 'unfollow:stop' };
+  | {
+      readonly type: 'unfollow:run';
+      readonly jobId: string;
+      readonly kind: ActionKind;
+      readonly pks: readonly string[];
+      readonly maxUnfollows: number;
+    }
+  | { readonly type: 'unfollow:stop' }
+  /** Download profile pictures; the CDN serves them to instagram.com only. Answers `AvatarResult[]`. */
+  | { readonly type: 'avatars:fetch'; readonly requests: readonly AvatarRequest[] };
 
 export interface CollectorStatus {
   /** Build of the content script answering. Older than the page's build means the tab needs a reload. */
@@ -66,17 +75,21 @@ export type BackgroundRequest =
   | { readonly type: 'scheduler:set'; readonly enabled: boolean }
   /** Run the automatic check now, ignoring the 24-hour wait and failure back-off. */
   | { readonly type: 'scheduler:trigger' }
-  /** Unfollow these accounts of `viewerId`. Refused if the Instagram tab is signed in to another account. */
-  | { readonly type: 'unfollow:start'; readonly viewerId: string; readonly pks: readonly string[] }
+  /** Unfollow (or remove as followers) these accounts of `viewerId`. Refused if the Instagram tab is signed in to another account. */
+  | { readonly type: 'unfollow:start'; readonly viewerId: string; readonly pks: readonly string[]; readonly kind: ActionKind }
   | { readonly type: 'unfollow:stop' }
   | { readonly type: 'unfollow:resume' }
   | { readonly type: 'unfollow:discard' }
   | { readonly type: 'unfollow:status'; readonly viewerId: string | null }
   /** The side panel is showing this account: its new unfollowers have been seen. */
   | { readonly type: 'badge:clear'; readonly viewerId: string | null }
+  /** Profile pictures for these accounts, as `{ [pk]: dataUrl }`; missing ones are fetched through an Instagram tab. */
+  | { readonly type: 'avatars:load'; readonly viewerId: string; readonly pks: readonly string[] }
   // Dev builds only (see lib/devBridge.ts).
   | { readonly type: 'dev:reload' }
   | { readonly type: 'dev:summary' }
+  /** Loads pictures for the don't-follow-back list and reports counts only. */
+  | { readonly type: 'dev:avatars' }
   | { readonly type: 'dev:sync' };
 
 export type EnvProblem = 'no_instagram_tab' | 'content_script_missing' | 'signed_out';

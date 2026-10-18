@@ -4,17 +4,20 @@
  */
 import { browser } from 'wxt/browser';
 import type { UnfollowLedger } from './limits';
-import type { UnfollowRunOutcome } from './unfollow';
+import type { ActionKind, UnfollowRunOutcome } from './unfollow';
 
 export type UnfollowJobStatus = 'running' | 'paused' | 'finished';
 
 export interface UnfollowJob {
   readonly id: string;
+  /** Absent on jobs saved before removing followers existed: those unfollow. */
+  readonly kind?: ActionKind;
   readonly viewerId: string;
   readonly tabId: number | null;
   /** Accounts still to unfollow, in order. */
   readonly queue: readonly string[];
   readonly total: number;
+  /** Accounts the action succeeded for (unfollowed or removed). */
   readonly unfollowed: number;
   readonly skipped: number;
   readonly status: UnfollowJobStatus;

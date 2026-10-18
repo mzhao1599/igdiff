@@ -55,6 +55,6 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: follower-tracker-chrome
+          name: igdiff-chrome
           path: extension/.output/*-chrome.zip
           if-no-files-found: error

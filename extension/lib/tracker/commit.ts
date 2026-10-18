@@ -5,7 +5,13 @@
 import type { CollectionResult, Verification } from '../collector/collect';
 import { diffSnapshots, type FollowSets, type SnapshotDiff } from './diff';
 
-export type TrackerEventType = 'follower_gained' | 'follower_lost' | 'following_added' | 'following_removed';
+export type TrackerEventType =
+  | 'follower_gained'
+  | 'follower_lost'
+  /** A follower the user removed with IgDiff: not an unfollow by them. */
+  | 'follower_removed'
+  | 'following_added'
+  | 'following_removed';
 
 export interface PlannedEvent {
   readonly type: TrackerEventType;
@@ -45,10 +51,16 @@ function isSuspicious(unconfirmedCount: number, previousSize: number, guard: Com
   return unconfirmedCount > Math.max(guard.suspiciousMinimum, guard.suspiciousRatio * previousSize);
 }
 
+/**
+ * `removedByYou`: followers the user removed with IgDiff since the previous
+ * snapshot. Their disappearance is expected, so it is recorded as "You removed"
+ * and never counts as a suspicious loss.
+ */
 export function planCommit(
   previous: FollowSets | null,
   result: CollectionResult,
   guard: CommitGuard = DEFAULT_COMMIT_GUARD,
+  removedByYou: ReadonlySet<string> = new Set(),
 ): CommitPlan {
   if (result.outcome !== 'completed') {
     return {
@@ -70,7 +82,10 @@ export function planCommit(
 
   // Many accounts vanishing at once without show_many confirming it looks like a
   // broken list, not a mass unfollow. Keep the previous snapshot instead.
-  const lostUnconfirmed = unconfirmed(diff.followersLost, result.lostFollowerChecks);
+  const lostUnconfirmed = unconfirmed(
+    diff.followersLost.filter(pk => !removedByYou.has(pk)),
+    result.lostFollowerChecks,
+  );
   if (isSuspicious(lostUnconfirmed, previous.followerIds.length, guard)) {
     return {
       kind: 'rejected',
@@ -89,11 +104,15 @@ export function planCommit(
 
   const events: PlannedEvent[] = [
     ...diff.followersGained.map(pk => ({ type: 'follower_gained' as const, pk })),
-    ...diff.followersLost.map(pk => ({
-      type: 'follower_lost' as const,
-      pk,
-      verification: result.lostFollowerChecks[pk] ?? ('unconfirmed' as const),
-    })),
+    ...diff.followersLost.map(pk =>
+      removedByYou.has(pk)
+        ? { type: 'follower_removed' as const, pk }
+        : {
+            type: 'follower_lost' as const,
+            pk,
+            verification: result.lostFollowerChecks[pk] ?? ('unconfirmed' as const),
+          },
+    ),
     ...diff.followingAdded.map(pk => ({ type: 'following_added' as const, pk })),
     ...diff.followingRemoved.map(pk => ({
       type: 'following_removed' as const,

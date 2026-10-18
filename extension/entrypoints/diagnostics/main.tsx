@@ -38,6 +38,7 @@ const PROBLEM_HINTS: Record<EnvProblem | 'already_running' | 'budget', string> =
 const EVENT_LABELS: Record<EventRecord['type'], string> = {
   follower_gained: 'New follower',
   follower_lost: 'Unfollowed you',
+  follower_removed: 'You removed',
   following_added: 'You followed',
   following_removed: 'You unfollowed',
 };
@@ -94,7 +95,7 @@ function staleBuildHint(env: EnvStatus | null): string | null {
     return null;
   }
   if (env.backgroundBuildId !== BUILD_ID) {
-    return 'The extension is running an older build than this page. On chrome://extensions click the reload arrow on Follower Tracker (dev), then reload the Instagram tab and this page.';
+    return 'The extension is running an older build than this page. On chrome://extensions click the reload arrow on IgDiff (dev), then reload the Instagram tab and this page.';
   }
   if (env.collector && env.collector.buildId !== BUILD_ID) {
     return 'The Instagram tab is running an older build. Reload the Instagram tab (Cmd+R), then click Refresh here.';
@@ -529,7 +530,7 @@ function DataSection({ refreshKey }: { refreshKey: number }) {
     const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }));
     const link = document.createElement('a');
     link.href = url;
-    link.download = `follower-tracker-${viewerId}-${new Date().toISOString().slice(0, 10)}.json`;
+    link.download = `igdiff-${viewerId}-${new Date().toISOString().slice(0, 10)}.json`;
     link.click();
     URL.revokeObjectURL(url);
   };
@@ -824,7 +825,7 @@ function App() {
   return (
     <main>
       <header>
-        <h1>Follower Tracker diagnostics</h1>
+        <h1>IgDiff diagnostics</h1>
         <p>
           Development build only. Version {browser.runtime.getManifest().version}, built{' '}
           {BUILD_ID === 'unbuilt' ? 'from source' : new Date(BUILD_ID).toLocaleString()}. All data stays in this

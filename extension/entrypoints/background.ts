@@ -33,7 +33,8 @@ import {
 import { schedulerState } from '../lib/scheduler/state';
 import { recordBlock, recordUnfollows, unfollowAllowance, unfollowsToday } from '../lib/actions/limits';
 import { unfollowState, type UnfollowJob } from '../lib/actions/state';
-import type { UnfollowItemResult, UnfollowRunResult } from '../lib/actions/unfollow';
+import { isDone, type ActionKind, type UnfollowItemResult, type UnfollowRunResult } from '../lib/actions/unfollow';
+import { AVATAR_BATCH, avatarKey, avatarsToFetch, type AvatarRecord, type AvatarResult } from '../lib/avatars';
 import { unfollowerBadge } from '../lib/notify/badge';
 import { computeRelationships } from '../lib/tracker/diff';
 import { TrackerStore, type CommitOutcome } from '../lib/tracker/store';
@@ -307,10 +308,18 @@ export default defineBackground(() => {
       const ours = lease !== null && lease.runId === runId;
       const viewerId = result.viewerId;
 
+      // Followers the user removed since the last snapshot didn't unfollow them.
+      const lastSyncAt = viewerId ? ((await db.getAccount(viewerId))?.lastSyncAt ?? -Infinity) : -Infinity;
+      const removedByYou = new Set(
+        (viewerId ? await db.listActions(viewerId, lastSyncAt) : [])
+          .filter(action => action.type === 'remove_follower' && action.outcome === 'removed')
+          .map(action => action.pk),
+      );
       // Results from a run whose lease was already declared dead are still saved when complete.
-      const outcome = await db.commit(result);
+      const outcome = await db.commit(result, undefined, removedByYou);
       if (outcome.status === 'committed' && outcome.diffCounts) {
-        await unfollowerBadge.add(outcome.viewerId, outcome.diffCounts.followersLost);
+        const { followersLost, followersRemovedByYou = 0 } = outcome.diffCounts;
+        await unfollowerBadge.add(outcome.viewerId, followersLost - followersRemovedByYou);
       }
 
       if (ours && viewerId) {
@@ -348,6 +357,7 @@ export default defineBackground(() => {
     const ack = await sendToTab<{ started: boolean }>(job.tabId, {
       type: 'unfollow:run',
       jobId: job.id,
+      kind: job.kind ?? 'unfollow',
       pks: job.queue,
       maxUnfollows,
     }).catch(() => ({ started: false }));
@@ -384,14 +394,14 @@ export default defineBackground(() => {
     return { ok: true, tabId: env.tabId, remaining: allowance.remaining };
   }
 
-  function startUnfollows(viewerId: string, pks: readonly string[]): Promise<UnfollowStartResponse> {
+  function startUnfollows(viewerId: string, pks: readonly string[], kind: ActionKind): Promise<UnfollowStartResponse> {
     return exclusive(async () => {
       const check = await unfollowPreflight(viewerId);
       if (!check.ok) {
         return check;
       }
-      // Kept accounts are never unfollowed, whatever the page sent.
-      const kept = await (await store).listKeep(viewerId);
+      // Kept accounts are never unfollowed or removed, whatever the page sent. Following one back is fine.
+      const kept = kind === 'follow' ? new Set<string>() : await (await store).listKeep(viewerId);
       const queue = Array.from(new Set(pks)).filter(pk => !kept.has(pk));
       if (queue.length === 0) {
         return { ok: false, error: 'nothing_to_do' };
@@ -400,6 +410,7 @@ export default defineBackground(() => {
       return launchUnfollows(
         {
           id: crypto.randomUUID(),
+          kind,
           viewerId,
           tabId: check.tabId,
           queue,
@@ -427,7 +438,7 @@ export default defineBackground(() => {
       if (!check.ok) {
         return check;
       }
-      const kept = await (await store).listKeep(job.viewerId);
+      const kept = job.kind === 'follow' ? new Set<string>() : await (await store).listKeep(job.viewerId);
       return launchUnfollows({ ...job, tabId: check.tabId, queue: job.queue.filter(pk => !kept.has(pk)) }, check.remaining);
     });
   }
@@ -442,19 +453,19 @@ export default defineBackground(() => {
       await (await store).recordAction({
         viewerId: job.viewerId,
         pk: item.pk,
-        type: 'unfollow',
+        type: job.kind ?? 'unfollow',
         outcome: item.outcome,
         detail: item.detail,
         at: item.at,
       });
-      if (item.outcome === 'unfollowed') {
+      if (isDone(item.outcome)) {
         await unfollowState.setLedger(job.viewerId, recordUnfollows(state.ledgers[job.viewerId], 1, item.at));
       }
       await unfollowState.setJob({
         ...job,
         queue: job.queue.filter(pk => pk !== item.pk),
-        unfollowed: job.unfollowed + (item.outcome === 'unfollowed' ? 1 : 0),
-        skipped: job.skipped + (item.outcome === 'unfollowed' ? 0 : 1),
+        unfollowed: job.unfollowed + (isDone(item.outcome) ? 1 : 0),
+        skipped: job.skipped + (isDone(item.outcome) ? 0 : 1),
         updatedAt: item.at,
       });
       broadcast({ type: 'unfollow:changed' });
@@ -560,6 +571,54 @@ export default defineBackground(() => {
     };
   }
 
+  // --- Profile pictures ------------------------------------------------------------
+
+  /** Pictures that failed (usually an expired URL) aren't retried until the next sync brings a new URL, or an hour passes. */
+  const AVATAR_RETRY_MS = 60 * 60_000;
+  const failedAvatars = new Map<string, number>();
+  const fetchingAvatars = new Set<string>();
+
+  async function loadAvatars(viewerId: string, pks: readonly string[]): Promise<Record<string, string>> {
+    const db = await store;
+    const wanted = pks.slice(0, 500);
+    const [profiles, cached] = await Promise.all([db.getProfiles(viewerId, wanted), db.getAvatars(viewerId, wanted)]);
+    const now = Date.now();
+    for (const [key, at] of failedAvatars) {
+      if (now - at > AVATAR_RETRY_MS) {
+        failedAvatars.delete(key);
+      }
+    }
+    const skip = new Set([...failedAvatars.keys(), ...fetchingAvatars]);
+    const missing = avatarsToFetch(wanted, pk => profiles.get(pk)?.profilePicUrl, cached, skip).slice(0, AVATAR_BATCH);
+    if (missing.length > 0) {
+      const env = await readEnv();
+      if (env.tabId !== null && env.collector) {
+        const keys = missing.map(request => avatarKey(request.url)!);
+        keys.forEach(key => fetchingAvatars.add(key));
+        try {
+          const results = await sendToTab<AvatarResult[]>(env.tabId, { type: 'avatars:fetch', requests: missing });
+          const fresh: AvatarRecord[] = [];
+          for (const result of results) {
+            const key = avatarKey(result.url)!;
+            if (result.dataUrl) {
+              fresh.push({ viewerId, pk: result.pk, key, dataUrl: result.dataUrl, fetchedAt: now });
+            } else {
+              failedAvatars.set(key, now);
+            }
+          }
+          await db.putAvatars(fresh);
+          fresh.forEach(record => cached.set(record.pk, record));
+        } catch {
+          // The tab went away or reloaded: show what is cached.
+        } finally {
+          keys.forEach(key => fetchingAvatars.delete(key));
+        }
+      }
+    }
+    // An older picture of the same person beats an initial.
+    return Object.fromEntries(Array.from(cached, ([pk, record]) => [pk, record.dataUrl]));
+  }
+
   // --- Messages ------------------------------------------------------------------
 
   const fromInstagramTab = (sender: Browser.runtime.MessageSender): sender is Browser.runtime.MessageSender & { tab: { id: number } } =>
@@ -603,7 +662,7 @@ export default defineBackground(() => {
         void pauseInterruptedUnfollows(sender.tab.id);
         return tryAutoSync({ preferTabId: sender.tab.id, reloadedTabId: sender.tab.id });
       case 'unfollow:start':
-        return startUnfollows(message.viewerId, message.pks);
+        return startUnfollows(message.viewerId, message.pks, message.kind);
       case 'unfollow:resume':
         return resumeUnfollows();
       case 'unfollow:stop':
@@ -626,6 +685,8 @@ export default defineBackground(() => {
         return unfollowStatus(message.viewerId);
       case 'badge:clear':
         return unfollowerBadge.clear(message.viewerId).then(() => ({ ok: true }));
+      case 'avatars:load':
+        return loadAvatars(message.viewerId, message.pks);
       case 'unfollow:item':
         if (fromInstagramTab(sender)) {
           void onUnfollowItem(message.jobId, message.item);
@@ -656,6 +717,27 @@ export default defineBackground(() => {
         return Promise.resolve({ ok: true, reloading: true });
       case 'dev:summary':
         return DIAGNOSTICS_ENABLED ? devSummary() : undefined;
+      case 'dev:avatars':
+        return DIAGNOSTICS_ENABLED
+          ? (async () => {
+              const [account] = await (await store).listAccounts();
+              const latest = account ? await (await store).getLatestSnapshot(account.viewerId) : null;
+              if (!account || !latest) {
+                return { account: null };
+              }
+              const pks = computeRelationships(latest).notFollowingBack;
+              const started = Date.now();
+              const loaded = await loadAvatars(account.viewerId, pks);
+              const sizes = Object.values(loaded).map(url => url.length);
+              return {
+                asked: pks.length,
+                loaded: sizes.length,
+                ms: Date.now() - started,
+                averageKb: sizes.length ? Math.round(sizes.reduce((a, b) => a + b, 0) / sizes.length / 1024) : 0,
+                failed: failedAvatars.size,
+              };
+            })()
+          : undefined;
       case 'dev:sync':
         return DIAGNOSTICS_ENABLED
           ? (async () => {

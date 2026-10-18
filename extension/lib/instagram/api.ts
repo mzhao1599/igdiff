@@ -7,6 +7,8 @@
  *   POST /api/v1/friendships/show_many/                bulk friendship status
  *
  *   POST /api/v1/friendships/destroy/{id}/             unfollow
+ *   POST /api/v1/friendships/remove_follower/{id}/     remove a follower
+ *   POST /api/v1/friendships/create/{id}/              follow (a request, for private accounts)
  *
  * POSTs carry what the web app adds to its own (page token, checksum, claim,
  * revision): without them Instagram answers with its HTML app page.
@@ -126,6 +128,8 @@ export interface ProfileInfo {
 export interface FriendshipFlags {
   readonly following: boolean | null;
   readonly followedBy: boolean | null;
+  /** You asked to follow this private account and they haven't approved yet. Only from single-account answers. */
+  readonly outgoingRequest?: boolean | null;
 }
 
 export type ListKind = 'following' | 'followers';
@@ -133,6 +137,15 @@ export type ListKind = 'following' | 'followers';
 interface RawFriendship {
   followed_by?: boolean;
   following?: boolean;
+  outgoing_request?: boolean;
+}
+
+function readFlags(raw: RawFriendship | undefined): FriendshipFlags {
+  return {
+    following: typeof raw?.following === 'boolean' ? raw.following : null,
+    followedBy: typeof raw?.followed_by === 'boolean' ? raw.followed_by : null,
+    outgoingRequest: typeof raw?.outgoing_request === 'boolean' ? raw.outgoing_request : null,
+  };
 }
 
 export interface RawUser {
@@ -529,36 +542,53 @@ export async function fetchFriendshipStatus(
   if (result.data === null) {
     return { ...result, data: null };
   }
-  const source = result.data.friendship_status ?? result.data;
-  return {
-    ...result,
-    data: {
-      following: typeof source.following === 'boolean' ? source.following : null,
-      followedBy: typeof source.followed_by === 'boolean' ? source.followed_by : null,
-    },
-  };
+  return { ...result, data: readFlags(result.data.friendship_status ?? result.data) };
 }
 
-export interface UnfollowAnswer {
-  /** `friendship_status.following` after the call when Instagram sent it; must not be true. */
-  readonly following: boolean | null;
-}
-
-interface RawUnfollowResponse {
+interface RawFriendshipChange {
   status?: string;
   friendship_status?: RawFriendship;
+}
+
+/** The friendship after a change, when Instagram sent it (`null` fields when it didn't). */
+function friendshipAfter(result: ApiResult<RawFriendshipChange>): ApiResult<FriendshipFlags> {
+  if (result.data === null) {
+    return { ...result, data: null };
+  }
+  return { ...result, data: readFlags(result.data.friendship_status) };
 }
 
 /**
  * Unfollows one account, with the request the web app's own unfollow sends.
  * Changes the user's account: only call this for an account the user chose to unfollow.
  */
-export async function unfollowUser(client: InstagramClient, userId: string): Promise<ApiResult<UnfollowAnswer>> {
+export async function unfollowUser(client: InstagramClient, userId: string): Promise<ApiResult<FriendshipFlags>> {
   const url = `${INSTAGRAM_ORIGIN}/api/v1/friendships/destroy/${encodeURIComponent(userId)}/`;
-  const result = await postForm<RawUnfollowResponse>(client, url, { container_module: 'profile', user_id: userId });
-  if (result.data === null) {
-    return { ...result, data: null };
-  }
-  const following = result.data.friendship_status?.following;
-  return { ...result, data: { following: typeof following === 'boolean' ? following : null } };
+  return friendshipAfter(await postForm<RawFriendshipChange>(client, url, { container_module: 'profile', user_id: userId }));
+}
+
+/**
+ * Follows one account, with the request the web app's Follow button sends. A
+ * private account gets a follow request instead (`outgoingRequest`). Instagram's
+ * own "are you sure?" checks stay on: if it wants one, the follow doesn't happen.
+ * Changes the user's account: only call this for an account the user chose.
+ */
+export async function followUser(client: InstagramClient, userId: string): Promise<ApiResult<FriendshipFlags>> {
+  const url = `${INSTAGRAM_ORIGIN}/api/v1/friendships/create/${encodeURIComponent(userId)}/`;
+  return friendshipAfter(
+    await postForm<RawFriendshipChange>(client, url, {
+      container_module: 'profile',
+      include_follow_friction_check: 'true',
+      user_id: userId,
+    }),
+  );
+}
+
+/**
+ * Removes one of the user's followers, with the request the web app's "Remove"
+ * sends. Changes the user's account: only call this for an account the user chose.
+ */
+export async function removeFollower(client: InstagramClient, userId: string): Promise<ApiResult<FriendshipFlags>> {
+  const url = `${INSTAGRAM_ORIGIN}/api/v1/friendships/remove_follower/${encodeURIComponent(userId)}/`;
+  return friendshipAfter(await postForm<RawFriendshipChange>(client, url, {}));
 }

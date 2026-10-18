@@ -1,6 +1,7 @@
 import { browser } from 'wxt/browser';
 import { defineContentScript } from 'wxt/utils/define-content-script';
 import { runUnfollows } from '../lib/actions/unfollow';
+import { fetchAvatars } from '../lib/avatars';
 import { collect, type CollectionProgress } from '../lib/collector/collect';
 import { runProbe } from '../lib/collector/probe';
 import { installDevBridge } from '../lib/devBridge';
@@ -144,6 +145,7 @@ export default defineContentScript({
           const { jobId } = message;
           unfollowing = controller;
           void runUnfollows({
+            kind: message.kind,
             client,
             viewerId: readSession(document.cookie).viewerId,
             pks: message.pks,
@@ -163,6 +165,9 @@ export default defineContentScript({
           unfollowing?.abort();
           return Promise.resolve({ stopping: wasRunning });
         }
+        case 'avatars:fetch':
+          // No cookies: the pictures are public, signed URLs.
+          return fetchAvatars(pageFetch, message.requests);
         default:
           return undefined;
       }
@@ -183,6 +188,7 @@ export default defineContentScript({
         sync: () => sendToBackground({ type: 'dev:sync' }),
         stop: () => sendToBackground({ type: 'sync:stop' }),
         summary: () => sendToBackground({ type: 'dev:summary' }),
+        avatars: () => sendToBackground({ type: 'dev:avatars' }),
         scheduler: () => sendToBackground({ type: 'scheduler:status' }),
         // Read-only. Starting an unfollow is deliberately not a bridge command: page scripts must never change the account.
         unfollowStatus: () => sendToBackground({ type: 'unfollow:status', viewerId: readSession(document.cookie).viewerId }),

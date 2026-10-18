@@ -1,9 +1,8 @@
 name: Deploy to GitHub Pages
 
+# Deploys the legacy web app's landing page. Manual only, so pushes to IgDiff
+# never publish the old site.
 on:
-  push:
-    branches:
-      - main # CAMBIO IMPORTANTE: Los repos nuevos usan 'main', no 'master'
   workflow_dispatch:
 
 # Permite que solo corra un deploy a la vez

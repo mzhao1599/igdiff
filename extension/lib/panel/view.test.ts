@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import type { ActionRecord, EventRecord, ProfileRecord } from '../tracker/store';
 import {
+  countSeries,
   csvField,
   estimateUnfollowMs,
+  followerDiff,
+  linePath,
   listsCsv,
   formatAgo,
   formatDuration,
@@ -11,13 +14,18 @@ import {
   panelLists,
   recentUnfollowers,
   selectable,
+  sortAccounts,
 } from './view';
 
-const action = (pk: string, outcome: ActionRecord['outcome']): ActionRecord => ({
+const action = (
+  pk: string,
+  outcome: ActionRecord['outcome'],
+  type: ActionRecord['type'] = outcome === 'removed' ? 'remove_follower' : 'unfollow',
+): ActionRecord => ({
   id: 1,
   viewerId: 'v',
   pk,
-  type: 'unfollow',
+  type,
   outcome,
   detail: null,
   at: 1,
@@ -44,14 +52,84 @@ const event = (type: EventRecord['type'], detectedAt: number): EventRecord => ({
 });
 
 describe('panelLists', () => {
-  it('drops only accounts actually unfollowed here since the last sync', () => {
-    const lists = panelLists(
-      { notFollowingBack: ['1', '2', '3'], fans: ['f'], mutuals: ['m', 'n'] },
-      [action('1', 'unfollowed'), action('2', 'failed'), action('3', 'not_found'), action('n', 'unfollowed')],
-    );
+  const sets = { followerIds: ['f', 'g', 'm', 'n'], followingIds: ['1', '2', '3', 'm', 'n'] };
+
+  it('splits the snapshot into the five lists, keeping order', () => {
+    expect(panelLists(sets, [])).toEqual({
+      followers: ['f', 'g', 'm', 'n'],
+      following: ['1', '2', '3', 'm', 'n'],
+      notFollowingBack: ['1', '2', '3'],
+      fans: ['f', 'g'],
+      mutuals: ['m', 'n'],
+    });
+  });
+
+  it('applies only actions that actually happened since the last sync', () => {
+    const lists = panelLists(sets, [
+      action('1', 'unfollowed'),
+      action('2', 'failed'),
+      action('3', 'not_found'),
+      action('n', 'unfollowed'),
+      action('g', 'removed'),
+      action('m', 'failed', 'remove_follower'),
+    ]);
     expect(lists.notFollowingBack).toEqual(['2', '3']);
+    // A mutual you unfollowed still follows you: now a fan.
+    expect(lists.fans).toEqual(['f', 'n']);
     expect(lists.mutuals).toEqual(['m']);
-    expect(lists.fans).toEqual(['f']);
+    expect(lists.followers).toEqual(['f', 'm', 'n']);
+  });
+
+  it('makes a fan you followed back a mutual, but not one who only got a request', () => {
+    const lists = panelLists(sets, [action('f', 'followed', 'follow'), action('g', 'requested', 'follow')]);
+    expect(lists.following).toEqual(['f', '1', '2', '3', 'm', 'n']);
+    expect(lists.mutuals).toEqual(['f', 'm', 'n']);
+    expect(lists.fans).toEqual(['g']);
+  });
+
+  it('moves a mutual you removed to "don\'t follow back"', () => {
+    const lists = panelLists(sets, [action('m', 'removed')]);
+    expect(lists.mutuals).toEqual(['n']);
+    expect(lists.notFollowingBack).toEqual(['1', '2', '3', 'm']);
+  });
+});
+
+describe('sortAccounts', () => {
+  const profiles = new Map(['b', 'a', 'c'].map(name => [name, profile(name === 'a' ? 'zed' : name)]));
+
+  it('keeps Instagram order, reverses it, or sorts by username', () => {
+    expect(sortAccounts(['b', 'a', 'c'], 'recent', profiles)).toEqual(['b', 'a', 'c']);
+    expect(sortAccounts(['b', 'a', 'c'], 'oldest', profiles)).toEqual(['c', 'a', 'b']);
+    expect(sortAccounts(['b', 'a', 'c'], 'az', profiles)).toEqual(['b', 'c', 'a']);
+  });
+});
+
+describe('diff and graph', () => {
+  it('counts follower changes in the window, not removals', () => {
+    const day = 86_400_000;
+    const now = 100 * day;
+    const events = [
+      event('follower_gained', now - day),
+      event('follower_lost', now - 2 * day),
+      event('follower_removed', now - 2 * day),
+      event('follower_lost', now - 9 * day),
+      event('following_added', now - day),
+    ];
+    expect(followerDiff(events, now)).toEqual({ gained: 1, lost: 1 });
+    expect(followerDiff(events, now, 30)).toEqual({ gained: 1, lost: 2 });
+  });
+
+  it('orders snapshot counts oldest first', () => {
+    const snap = (takenAt: number, followerCount: number) =>
+      ({ takenAt, followerCount, followingCount: 5 }) as Parameters<typeof countSeries>[0][number];
+    expect(countSeries([snap(30, 3), snap(10, 1), snap(20, 2)]).map(point => point.followers)).toEqual([1, 2, 3]);
+  });
+
+  it('draws a path spanning the box, flat for constant or single values', () => {
+    expect(linePath([], 100, 20)).toBe('');
+    expect(linePath([5], 100, 20)).toBe('M2,10H98');
+    expect(linePath([1, 3], 100, 20)).toBe('M2.0,18.0L98.0,2.0');
+    expect(linePath([4, 4, 4], 100, 20)).toBe('M2.0,10.0L50.0,10.0L98.0,10.0');
   });
 });
 
@@ -120,7 +198,7 @@ describe('CSV export', () => {
 
   it('writes one row per account with its list', () => {
     const csv = listsCsv(
-      { notFollowingBack: ['a'], fans: ['b'], mutuals: [] },
+      { followers: ['b'], following: ['a'], notFollowingBack: ['a'], fans: ['b'], mutuals: [] },
       new Map([['a', profile('alpha', 'Alpha, Inc')]]),
       new Set(['a']),
     );

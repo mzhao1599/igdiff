@@ -131,7 +131,13 @@ header.top {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
   gap: 6px;
-  padding: 12px 16px;
+  padding: 12px 16px 0;
+}
+
+.stats-3 {
+  grid-template-columns: repeat(3, 1fr);
+  padding-top: 6px;
+  padding-bottom: 12px;
 }
 
 .stat {
@@ -155,6 +161,45 @@ header.top {
 .stat span {
   font-size: 11px;
   color: var(--muted);
+}
+
+.stat .diff {
+  display: block;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text);
+  line-height: 1.6;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.plus {
+  color: var(--ok);
+}
+
+.minus {
+  color: var(--danger);
+}
+
+.stat .spark {
+  display: block;
+  width: 100%;
+  height: 22px;
+  margin: 2px 0 1px;
+}
+
+.spark path,
+.chart path {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
+}
+
+.chart.following path {
+  stroke: var(--muted);
 }
 
 .notice {
@@ -205,6 +250,16 @@ header.top {
   border-bottom: 1px solid var(--border);
 }
 
+.toolbar select {
+  font: inherit;
+  font-size: 13px;
+  padding: 5px 6px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+}
+
 .toolbar input[type='search'] {
   flex: 1;
   min-width: 0;
@@ -252,6 +307,12 @@ header.top {
   min-width: 0;
 }
 
+.who .handle {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .who a {
   color: var(--text);
   font-weight: 600;
@@ -286,6 +347,17 @@ header.top {
 
 .keep[aria-pressed='true'] {
   color: var(--warn);
+}
+
+.row-actions {
+  display: flex;
+  gap: 4px;
+  flex: none;
+}
+
+.row .row-actions button {
+  padding: 5px 8px;
+  font-size: 12px;
 }
 
 .row .confirm {
@@ -370,6 +442,55 @@ header.top {
   margin-top: 14px;
 }
 
+.graph section {
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.graph-head b {
+  font-size: 18px;
+  font-variant-numeric: tabular-nums;
+}
+
+.graph .muted {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 6px 0 0;
+}
+
+.chart-box {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.scale {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  font-size: 10px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.chart {
+  display: block;
+  flex: 1;
+  min-width: 0;
+  height: 80px;
+  border-left: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.axis {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--muted);
+  padding-left: 34px;
+}
+
 .day {
   padding: 10px 16px 4px;
   font-size: 12px;
@@ -430,4 +551,19 @@ button.icon[aria-pressed='true'] {
   gap: 8px;
   align-items: center;
   margin-top: 10px;
+}
+
+/* Narrow panels: actions get their own line under the name, so names stay readable. */
+@media (max-width: 380px) {
+  .row {
+    flex-wrap: wrap;
+    row-gap: 6px;
+  }
+
+  .row .row-actions,
+  .row .confirm {
+    order: 5;
+    flex-basis: 100%;
+    padding-left: 72px;
+  }
 }

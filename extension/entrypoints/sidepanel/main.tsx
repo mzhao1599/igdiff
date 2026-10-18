@@ -1,9 +1,9 @@
-import { render } from 'preact';
+import { render, type ComponentChildren } from 'preact';
 import { useCallback, useEffect, useMemo, useState } from 'preact/hooks';
 import { browser } from 'wxt/browser';
 import { DAILY_UNFOLLOW_LIMIT } from '../../lib/actions/limits';
 import type { UnfollowJob } from '../../lib/actions/state';
-import type { UnfollowProgress } from '../../lib/actions/unfollow';
+import { isDone, type ActionKind, type UnfollowProgress } from '../../lib/actions/unfollow';
 import type { CollectionProgress } from '../../lib/collector/collect';
 import { DIAGNOSTICS_ENABLED } from '../../lib/env';
 import { INSTAGRAM_ORIGIN } from '../../lib/instagram/api';
@@ -18,31 +18,54 @@ import {
   type UnfollowStatus,
 } from '../../lib/messages';
 import {
+  countSeries,
   estimateUnfollowMs,
+  followerDiff,
   formatAgo,
   formatDuration,
   groupByDay,
+  linePath,
   listsCsv,
   matchesSearch,
   panelLists,
-  recentUnfollowers,
   selectable,
+  sortAccounts,
   type PanelLists,
+  type SortOrder,
 } from '../../lib/panel/view';
-import { computeRelationships } from '../../lib/tracker/diff';
 import {
   TrackerStore,
   type ActionRecord,
   type EventRecord,
   type LatestSnapshot,
   type ProfileRecord,
+  type SnapshotRecord,
 } from '../../lib/tracker/store';
+import { useAvatars } from './avatars';
 import './style.css';
 
 const storePromise = TrackerStore.open();
 const PAGE_SIZE = 100;
 
-type Tab = 'nfb' | 'fans' | 'mutuals' | 'changes';
+type ListTab = 'followers' | 'following' | 'nfb' | 'fans' | 'mutuals';
+type Tab = ListTab | 'changes' | 'graph';
+
+/** What you can do to the accounts in each list. */
+const TAB_ACTIONS: Record<ListTab, readonly ActionKind[]> = {
+  followers: ['follow', 'remove_follower'],
+  following: ['unfollow'],
+  nfb: ['unfollow'],
+  fans: ['follow', 'remove_follower'],
+  mutuals: ['unfollow', 'remove_follower'],
+};
+
+const ACTION_WORDS: Record<ActionKind, { verb: string; doing: string; past: string }> = {
+  unfollow: { verb: 'Unfollow', doing: 'Unfollowing', past: 'unfollowed' },
+  remove_follower: { verb: 'Remove', doing: 'Removing followers', past: 'removed' },
+  follow: { verb: 'Follow back', doing: 'Following back', past: 'followed' },
+};
+
+const isListTab = (tab: Tab): tab is ListTab => tab in TAB_ACTIONS;
 
 interface Data {
   readonly viewerId: string;
@@ -52,20 +75,23 @@ interface Data {
   readonly profiles: ReadonlyMap<string, ProfileRecord>;
   readonly keep: ReadonlySet<string>;
   readonly events: readonly EventRecord[];
-  /** Unfollow attempts since the latest snapshot, newest first. */
+  /** Unfollow and remove attempts since the latest snapshot, newest first. */
   readonly actions: readonly ActionRecord[];
+  /** Newest first, for the graph. */
+  readonly snapshots: readonly SnapshotRecord[];
 }
 
 async function loadData(viewerId: string): Promise<Data> {
   const db = await storePromise;
-  const [account, latest, keep, events] = await Promise.all([
+  const [account, latest, keep, events, snapshots] = await Promise.all([
     db.getAccount(viewerId),
     db.getLatestSnapshot(viewerId),
     db.listKeep(viewerId),
     db.listEvents(viewerId, 300),
+    db.listSnapshots(viewerId, 90),
   ]);
   const actions = latest ? await db.listActions(viewerId, latest.takenAt) : [];
-  const lists = latest ? panelLists(computeRelationships(latest), actions) : null;
+  const lists = latest ? panelLists(latest, actions) : null;
   const pks = new Set([
     ...actions.map(action => action.pk),
     ...(lists?.notFollowingBack ?? []),
@@ -74,22 +100,23 @@ async function loadData(viewerId: string): Promise<Data> {
     ...events.map(event => event.pk),
   ]);
   const profiles = await db.getProfiles(viewerId, Array.from(pks));
-  return { viewerId, username: account?.username ?? null, latest, lists, profiles, keep, events, actions };
+  return { viewerId, username: account?.username ?? null, latest, lists, profiles, keep, events, actions, snapshots };
 }
 
 const START_ERRORS: Record<UnfollowStartError, string> = {
-  no_instagram_tab: 'Open instagram.com in a tab. Unfollowing runs there, with your own session.',
+  no_instagram_tab: 'Open instagram.com in a tab. Unfollowing and removing run there, with your own session.',
   content_script_missing: 'Reload your Instagram tab, then try again.',
   signed_out: 'Sign in to Instagram in your Instagram tab, then try again.',
   wrong_account: 'Your Instagram tab is signed in to a different account than the one shown here.',
-  already_running: 'Unfollowing is already running.',
-  nothing_to_do: 'Nothing to unfollow: the selected accounts are all kept.',
-  blocked: 'Instagram blocked unfollowing for now.',
-  daily_limit: `You reached today's limit of ${DAILY_UNFOLLOW_LIMIT} unfollows.`,
+  already_running: 'Another batch is already running.',
+  nothing_to_do: 'Nothing to do: the selected accounts are all kept.',
+  blocked: 'Instagram blocked this for now.',
+  daily_limit: `You reached today's limit of ${DAILY_UNFOLLOW_LIMIT} unfollows and removals.`,
 };
 
 const EVENT_TEXT: Record<EventRecord['type'], (who: string) => string> = {
   follower_lost: who => `${who} unfollowed you`,
+  follower_removed: who => `You removed ${who}`,
   follower_gained: who => `${who} followed you`,
   following_removed: who => `You unfollowed ${who}`,
   following_added: who => `You followed ${who}`,
@@ -99,38 +126,31 @@ function formatClock(ms: number): string {
   return new Date(ms).toLocaleString(undefined, { weekday: 'short', hour: 'numeric', minute: '2-digit' });
 }
 
-function Avatar({ profile }: { profile: ProfileRecord | undefined }) {
-  const [broken, setBroken] = useState(false);
-  if (!profile?.profilePicUrl || broken) {
+/** `picture` is the cached profile picture; Instagram's own URLs don't load in extension pages. */
+function Avatar({ profile, picture }: { profile: ProfileRecord | undefined; picture: string | undefined }) {
+  if (!picture) {
     return <div class='avatar'>{(profile?.username ?? '?').slice(0, 1).toUpperCase()}</div>;
   }
-  return (
-    <img
-      class='avatar'
-      src={profile.profilePicUrl}
-      alt=''
-      loading='lazy'
-      referrerpolicy='no-referrer'
-      onError={() => setBroken(true)}
-    />
-  );
+  return <img class='avatar' src={picture} alt='' />;
 }
 
 function Who({ pk, profile }: { pk: string; profile: ProfileRecord | undefined }) {
   return (
     <div class='who'>
-      {profile ? (
-        <a href={`${INSTAGRAM_ORIGIN}/${encodeURIComponent(profile.username)}/`} target='_blank' rel='noreferrer'>
-          @{profile.username}
-        </a>
-      ) : (
-        <span>id {pk}</span>
-      )}
-      {profile?.isVerified && (
-        <span class='verified' title='Verified'>
-          ✓
-        </span>
-      )}
+      <div class='handle'>
+        {profile ? (
+          <a href={`${INSTAGRAM_ORIGIN}/${encodeURIComponent(profile.username)}/`} target='_blank' rel='noreferrer'>
+            @{profile.username}
+          </a>
+        ) : (
+          <span>id {pk}</span>
+        )}
+        {profile?.isVerified && (
+          <span class='verified' title='Verified'>
+            ✓
+          </span>
+        )}
+      </div>
       {profile?.fullName && <div class='name'>{profile.fullName}</div>}
     </div>
   );
@@ -179,7 +199,13 @@ function SyncLine({
   return <div class='sync-line'>{parts.join(' · ')}</div>;
 }
 
-function Failures({ failures }: { failures: ReadonlyArray<{ readonly who: string; readonly detail: string | null }> }) {
+function Failures({
+  kind,
+  failures,
+}: {
+  kind: ActionKind;
+  failures: ReadonlyArray<{ readonly who: string; readonly detail: string | null }>;
+}) {
   if (failures.length === 0) {
     return null;
   }
@@ -187,7 +213,7 @@ function Failures({ failures }: { failures: ReadonlyArray<{ readonly who: string
     <div class='sync-line' style={{ display: 'block' }}>
       {failures.slice(0, 3).map(failure => (
         <div key={failure.who}>
-          Couldn't unfollow {failure.who}
+          Couldn't {kind === 'remove_follower' ? 'remove' : kind} {failure.who}
           {failure.detail ? `: ${failure.detail}` : ''}
         </div>
       ))}
@@ -213,6 +239,7 @@ function JobBanner({
   onResume: () => void;
   onDismiss: () => void;
 }) {
+  const words = ACTION_WORDS[job.kind ?? 'unfollow'];
   const done = job.total - job.queue.length;
   const percent = job.total ? Math.round((done / job.total) * 100) : 0;
   if (job.status === 'running') {
@@ -221,7 +248,7 @@ function JobBanner({
     return (
       <div class='notice'>
         <b>
-          Unfollowing… {job.unfollowed} of {job.total}
+          {words.doing}… {job.unfollowed} of {job.total}
         </b>
         <div class='progress'>
           <div style={{ width: `${percent}%` }} />
@@ -244,10 +271,10 @@ function JobBanner({
     return (
       <div class={`notice ${job.outcome === 'blocked' ? 'bad' : 'warn'}`}>
         <b>
-          Paused with {job.queue.length} left ({job.unfollowed} unfollowed)
+          Paused with {job.queue.length} left ({job.unfollowed} {words.past})
         </b>
         {job.message && <div class='sync-line'>{job.message}</div>}
-        <Failures failures={failures} />
+        <Failures kind={job.kind ?? 'unfollow'} failures={failures} />
         <div class='actions'>
           <button class='primary' onClick={onResume}>
             Resume
@@ -260,10 +287,15 @@ function JobBanner({
   return (
     <div class={`notice${job.unfollowed === 0 ? ' bad' : job.skipped ? ' warn' : ''}`}>
       <b>
-        Done: {job.unfollowed} unfollowed{job.skipped ? `, ${job.skipped} not` : ''}.
+        Done: {job.unfollowed} {words.past}
+        {job.skipped ? `, ${job.skipped} not` : ''}.
       </b>
-      <Failures failures={failures} />
-      {job.unfollowed > 0 && <div class='sync-line'>They'll show as "You unfollowed" after the next sync.</div>}
+      <Failures kind={job.kind ?? 'unfollow'} failures={failures} />
+      {job.unfollowed > 0 && (
+        <div class='sync-line'>
+          They'll show as "You {ACTION_WORDS[job.kind ?? 'unfollow'].past}" after the next sync.
+        </div>
+      )}
       <div class='actions'>
         <button onClick={onDismiss}>Dismiss</button>
       </div>
@@ -302,7 +334,7 @@ function SettingsView({
 
   const exportJson = async () => {
     const everything = await (await storePromise).exportAccount(data.viewerId);
-    download(`follower-tracker-${name}-${stamp}.json`, 'application/json', JSON.stringify(everything, null, 2));
+    download(`igdiff-${name}-${stamp}.json`, 'application/json', JSON.stringify(everything, null, 2));
   };
 
   const deleteAll = async () => {
@@ -331,10 +363,10 @@ function SettingsView({
         </p>
       </section>
       <section>
-        <h3>Unfollowing</h3>
+        <h3>Unfollowing, removing and following back</h3>
         <p class='muted'>
-          {unfollow ? `${unfollow.today} of ${DAILY_UNFOLLOW_LIMIT} unfollows used today.` : 'Loading…'} Accounts you star
-          are never unfollowed.
+          {unfollow ? `${unfollow.today} of ${DAILY_UNFOLLOW_LIMIT} used today.` : 'Loading…'} Accounts you star are
+          never unfollowed or removed.
         </p>
       </section>
       <section>
@@ -343,7 +375,7 @@ function SettingsView({
         <div class='buttons'>
           <button
             disabled={!data.lists}
-            onClick={() => data.lists && download(`follower-tracker-${name}-${stamp}.csv`, 'text/csv', listsCsv(data.lists, data.profiles, data.keep))}
+            onClick={() => data.lists && download(`igdiff-${name}-${stamp}.csv`, 'text/csv', listsCsv(data.lists, data.profiles, data.keep))}
           >
             Export lists (CSV)
           </button>
@@ -370,23 +402,31 @@ function SettingsView({
 }
 
 function ConfirmSheet({
+  kind,
   count,
   remainingToday,
   onCancel,
   onConfirm,
 }: {
+  kind: ActionKind;
   count: number;
   remainingToday: number;
   onCancel: () => void;
   onConfirm: () => void;
 }) {
   const runs = Math.min(count, remainingToday);
+  const words = ACTION_WORDS[kind];
   return (
     <div class='sheet-backdrop' onClick={onCancel}>
       <div class='sheet' role='dialog' aria-modal='true' onClick={event => event.stopPropagation()}>
         <h2>
-          Unfollow {count} {count === 1 ? 'account' : 'accounts'}?
+          {words.verb} {count} {count === 1 ? 'account' : 'accounts'}
+          {kind === 'remove_follower' ? ' as followers' : ''}?
         </h2>
+        {kind === 'remove_follower' && (
+          <p>They stop following you. Instagram doesn't tell them, and they can follow you again.</p>
+        )}
+        {kind === 'follow' && <p>Private accounts get a follow request they can approve.</p>}
         <p>
           It runs in your Instagram tab at a deliberately slow pace, about {formatDuration(estimateUnfollowMs(runs))}.
           You can stop at any time.
@@ -400,7 +440,7 @@ function ConfirmSheet({
         <div class='actions'>
           <button onClick={onCancel}>Cancel</button>
           <button class='primary' onClick={onConfirm}>
-            Unfollow {count}
+            {words.verb} {count}
           </button>
         </div>
       </div>
@@ -422,8 +462,9 @@ function App() {
   const [query, setQuery] = useState('');
   const [shown, setShown] = useState(PAGE_SIZE);
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
-  const [confirmingRow, setConfirmingRow] = useState<string | null>(null);
-  const [sheetOpen, setSheetOpen] = useState(false);
+  const [confirmingRow, setConfirmingRow] = useState<{ pk: string; kind: ActionKind } | null>(null);
+  const [sheetKind, setSheetKind] = useState<ActionKind | null>(null);
+  const [sort, setSort] = useState<SortOrder>('recent');
   const [notice, setNotice] = useState<string | null>(null);
   const [view, setView] = useState<'main' | 'settings'>('main');
 
@@ -532,17 +573,36 @@ function App() {
   }, [busy]);
 
   const list = useMemo(() => {
-    if (!data?.lists) {
+    if (!data?.lists || !isListTab(tab)) {
       return [];
     }
-    const source = tab === 'fans' ? data.lists.fans : tab === 'mutuals' ? data.lists.mutuals : data.lists.notFollowingBack;
-    return source.filter(pk => matchesSearch(data.profiles.get(pk), query));
-  }, [data, tab, query]);
+    const source = data.lists[TAB_LISTS[tab]];
+    return sortAccounts(source, sort, data.profiles).filter(pk => matchesSearch(data.profiles.get(pk), query));
+  }, [data, tab, query, sort]);
 
-  const canUnfollow = viewerId !== null && liveViewerId === viewerId && job?.status !== 'running';
+  const canAct = viewerId !== null && liveViewerId === viewerId && job?.status !== 'running';
   const allowance = unfollow?.allowance ?? null;
   const remainingToday = allowance?.allowed ? allowance.remaining : 0;
   const keep = data?.keep ?? new Set<string>();
+  const actions = isListTab(tab) ? TAB_ACTIONS[tab] : [];
+  const relationships = useMemo(
+    () => ({
+      followers: new Set(data?.lists?.followers),
+      following: new Set(data?.lists?.following),
+      requested: new Set(
+        (data?.actions ?? []).filter(action => action.outcome === 'requested').map(action => action.pk),
+      ),
+    }),
+    [data],
+  );
+  /** Whether `kind` makes sense for this account right now. */
+  const applies = (kind: ActionKind, pk: string) =>
+    kind === 'follow'
+      ? !relationships.following.has(pk) && !relationships.requested.has(pk)
+      : kind === 'unfollow'
+        ? relationships.following.has(pk)
+        : relationships.followers.has(pk);
+  const selectedFor = (kind: ActionKind) => Array.from(selected).filter(pk => applies(kind, pk));
   const visibleSelectable = selectable(list, keep);
   const allSelected = visibleSelectable.length > 0 && visibleSelectable.every(pk => selected.has(pk));
 
@@ -550,17 +610,20 @@ function App() {
     setTab(next);
     setShown(PAGE_SIZE);
     setConfirmingRow(null);
+    // A selection only ever applies to the list it was made in.
+    setSelected(new Set());
   };
 
-  const toggleSelected = (pk: string) => {
-    const next = new Set(selected);
-    if (next.has(pk)) {
-      next.delete(pk);
-    } else {
-      next.add(pk);
-    }
-    setSelected(next);
-  };
+  const toggleSelected = (pk: string) =>
+    setSelected(previous => {
+      const next = new Set(previous);
+      if (next.has(pk)) {
+        next.delete(pk);
+      } else {
+        next.add(pk);
+      }
+      return next;
+    });
 
   const toggleKeep = async (pk: string) => {
     if (!viewerId || !data) {
@@ -580,18 +643,18 @@ function App() {
     setData({ ...data, keep: nextKeep });
   };
 
-  const startUnfollow = async (pks: readonly string[]) => {
+  const startAction = async (kind: ActionKind, pks: readonly string[]) => {
     if (!viewerId) {
       return;
     }
     setNotice(null);
-    const response = await sendToBackground<UnfollowStartResponse>({ type: 'unfollow:start', viewerId, pks });
+    const response = await sendToBackground<UnfollowStartResponse>({ type: 'unfollow:start', viewerId, pks, kind });
     if (response.ok) {
       setSelected(new Set());
       setConfirmingRow(null);
-      setSheetOpen(false);
+      setSheetKind(null);
     } else {
-      setSheetOpen(false);
+      setSheetKind(null);
       setNotice(
         `${START_ERRORS[response.error]}${response.until ? ` Try again after ${formatClock(response.until)}.` : ''}`,
       );
@@ -614,20 +677,54 @@ function App() {
     await refreshStatus(viewerId);
   };
 
-  const unfollowersRecent = data ? recentUnfollowers(data.events, now) : 0;
-  const stats: Array<{ key: Tab; value: number; label: string }> = [
-    { key: 'nfb', value: data?.lists?.notFollowingBack.length ?? 0, label: "don't follow back" },
-    { key: 'fans', value: data?.lists?.fans.length ?? 0, label: 'fans' },
-    { key: 'mutuals', value: data?.lists?.mutuals.length ?? 0, label: 'mutuals' },
-    { key: 'changes', value: unfollowersRecent, label: 'unfollowed you (30 d)' },
-  ];
+  const avatars = useAvatars(
+    data?.viewerId ?? null,
+    tab === 'changes' ? (data?.events ?? []).slice(0, 100).map(event => event.pk) : list.slice(0, shown),
+  );
+
+  const lists = data?.lists ?? null;
+  const diff = data ? followerDiff(data.events, now) : { gained: 0, lost: 0 };
+  const series = useMemo(() => countSeries(data?.snapshots ?? []), [data]);
+  const groups: Array<Array<{ key: Tab; value: number | null; label: string; extra?: ComponentChildren }>> = lists
+    ? [
+        [
+          { key: 'followers', value: lists.followers.length, label: 'followers' },
+          { key: 'following', value: lists.following.length, label: 'following' },
+          {
+            key: 'changes',
+            value: null,
+            label: 'diff · 7d',
+            extra: (
+              <span class='diff'>
+                <span class='plus'>+{diff.gained}</span> <span class='minus'>−{diff.lost}</span>
+              </span>
+            ),
+          },
+          {
+            key: 'graph',
+            value: null,
+            label: 'graph',
+            extra: (
+              <svg class='spark' viewBox='0 0 64 22' preserveAspectRatio='none' aria-hidden='true'>
+                <path d={linePath(series.map(point => point.followers), 64, 22)} />
+              </svg>
+            ),
+          },
+        ],
+        [
+          { key: 'nfb', value: lists.notFollowingBack.length, label: "don't follow back" },
+          { key: 'fans', value: lists.fans.length, label: 'fans' },
+          { key: 'mutuals', value: lists.mutuals.length, label: 'mutuals' },
+        ],
+      ]
+    : [];
 
   return (
     <div class='app'>
       <header class='top'>
         <div class='top-row'>
           <div>
-            <div class='brand'>Follower Tracker</div>
+            <div class='brand'>IgDiff</div>
             {data?.username && <div class='account'>@{data.username}</div>}
           </div>
           <div class='header-buttons'>
@@ -660,20 +757,21 @@ function App() {
         />
       ) : (
         <>
-      {data?.lists && (
-        <div class='stats'>
-          {stats.map(stat => (
+      {groups.map((group, index) => (
+        <div key={index} class={`stats stats-${group.length}`}>
+          {group.map(stat => (
             <button key={stat.key} class='stat' aria-pressed={tab === stat.key} onClick={() => switchTab(stat.key)}>
-              <b>{stat.value}</b>
+              {stat.value !== null && <b>{stat.value.toLocaleString()}</b>}
+              {stat.extra}
               <span>{stat.label}</span>
             </button>
           ))}
         </div>
-      )}
+      ))}
 
       {notice && <div class='notice bad'>{notice}</div>}
       {allowance && !allowance.allowed && allowance.reason === 'blocked' && (
-        <div class='notice bad'>Instagram blocked unfollowing. You can try again after {formatClock(allowance.until)}.</div>
+        <div class='notice bad'>Instagram blocked this for now. You can try again after {formatClock(allowance.until)}.</div>
       )}
       {viewerId && liveViewerId && liveViewerId !== viewerId && (
         <div class='notice warn'>Your Instagram tab is signed in to a different account than the one shown.</div>
@@ -683,7 +781,7 @@ function App() {
           job={job}
           progress={unfollowProgress}
           failures={(data?.actions ?? [])
-            .filter(action => action.at >= job.startedAt && action.outcome !== 'unfollowed')
+            .filter(action => action.at >= job.startedAt && !isDone(action.outcome))
             .map(action => ({
               who: `@${data?.profiles.get(action.pk)?.username ?? action.pk}`,
               detail: action.detail,
@@ -708,20 +806,20 @@ function App() {
             : 'Your first sync starts automatically in a few seconds, or press Sync now.'}
         </div>
       ) : tab === 'changes' ? (
-        <ChangesList events={data.events} profiles={data.profiles} />
+        <ChangesList events={data.events} profiles={data.profiles} avatars={avatars} />
+      ) : tab === 'graph' ? (
+        <GraphView snapshots={data.snapshots} events={data.events} now={now} />
       ) : (
         <>
           <div class='toolbar'>
-            {tab === 'nfb' && (
-              <input
-                type='checkbox'
-                aria-label='Select all shown, except kept accounts'
-                title='Select all shown (kept accounts are skipped)'
-                checked={allSelected}
-                disabled={!canUnfollow || visibleSelectable.length === 0}
-                onChange={() => setSelected(allSelected ? new Set() : new Set(visibleSelectable))}
-              />
-            )}
+            <input
+              type='checkbox'
+              aria-label='Select all shown, except kept accounts'
+              title='Select all shown (kept accounts are skipped)'
+              checked={allSelected}
+              disabled={!canAct || visibleSelectable.length === 0}
+              onChange={() => setSelected(allSelected ? new Set() : new Set(visibleSelectable))}
+            />
             <input
               type='search'
               placeholder='Search'
@@ -731,6 +829,15 @@ function App() {
                 setShown(PAGE_SIZE);
               }}
             />
+            <select
+              aria-label='Sort'
+              value={sort}
+              onChange={event => setSort((event.currentTarget as HTMLSelectElement).value as SortOrder)}
+            >
+              <option value='recent'>Recent</option>
+              <option value='oldest'>Oldest</option>
+              <option value='az'>A–Z</option>
+            </select>
           </div>
           {list.length === 0 ? (
             <div class='empty'>{query ? 'No matches.' : tab === 'nfb' ? 'Everyone you follow follows you back.' : 'Nobody here.'}</div>
@@ -740,48 +847,60 @@ function App() {
                 const profile = data.profiles.get(pk);
                 const kept = keep.has(pk);
                 const lastAttempt = data.actions.find(action => action.pk === pk);
+                const tag = relationships.requested.has(pk)
+                  ? 'requested'
+                  : tab === 'followers' && relationships.following.has(pk)
+                    ? 'mutual'
+                    : tab === 'following'
+                      ? relationships.followers.has(pk) ? 'follows you' : "doesn't follow back"
+                      : null;
                 return (
                   <li key={pk} class={`row${kept ? ' kept' : ''}`}>
-                    {tab === 'nfb' && (
-                      <input
-                        type='checkbox'
-                        aria-label={`Select @${profile?.username ?? pk}`}
-                        checked={selected.has(pk)}
-                        disabled={kept || !canUnfollow}
-                        onChange={() => toggleSelected(pk)}
-                      />
-                    )}
-                    <Avatar profile={profile} />
+                    <input
+                      type='checkbox'
+                      aria-label={`Select @${profile?.username ?? pk}`}
+                      checked={selected.has(pk)}
+                      disabled={kept || !canAct}
+                      onChange={() => toggleSelected(pk)}
+                    />
+                    <Avatar profile={profile} picture={avatars.get(pk)} />
                     <Who pk={pk} profile={profile} />
-                    {lastAttempt && lastAttempt.outcome !== 'unfollowed' && (
+                    {tag && <span class='status-tag'>{tag}</span>}
+                    {lastAttempt && !isDone(lastAttempt.outcome) && (
                       <span class='status-tag bad' title={lastAttempt.detail ?? undefined}>
-                        not unfollowed
+                        not {ACTION_WORDS[lastAttempt.type].past}
                       </span>
                     )}
-                    {tab === 'nfb' && (
-                      <>
-                        <button
-                          class='keep'
-                          aria-pressed={kept}
-                          title={kept ? 'Kept: never unfollowed by this tool' : 'Keep (never unfollow)'}
-                          onClick={() => void toggleKeep(pk)}
-                        >
-                          {kept ? '★' : '☆'}
+                    <button
+                      class='keep'
+                      aria-pressed={kept}
+                      title={kept ? 'Kept: never unfollowed or removed by IgDiff' : 'Keep (never unfollow or remove)'}
+                      onClick={() => void toggleKeep(pk)}
+                    >
+                      {kept ? '★' : '☆'}
+                    </button>
+                    {confirmingRow?.pk === pk ? (
+                      <span class='confirm'>
+                        Sure?
+                        <button class='danger' onClick={() => void startAction(confirmingRow.kind, [pk])}>
+                          {ACTION_WORDS[confirmingRow.kind].verb}
                         </button>
-                        {confirmingRow === pk ? (
-                          <span class='confirm'>
-                            Sure?
-                            <button class='danger' onClick={() => void startUnfollow([pk])}>
-                              Unfollow
+                        <button onClick={() => setConfirmingRow(null)}>No</button>
+                      </span>
+                    ) : (
+                      <span class='row-actions'>
+                        {actions
+                          .filter(kind => applies(kind, pk))
+                          .map(kind => (
+                            <button
+                              key={kind}
+                              disabled={!canAct || (kept && kind !== 'follow')}
+                              onClick={() => setConfirmingRow({ pk, kind })}
+                            >
+                              {ACTION_WORDS[kind].verb}
                             </button>
-                            <button onClick={() => setConfirmingRow(null)}>No</button>
-                          </span>
-                        ) : (
-                          <button disabled={kept || !canUnfollow} onClick={() => setConfirmingRow(pk)}>
-                            Unfollow
-                          </button>
-                        )}
-                      </>
+                          ))}
+                      </span>
                     )}
                   </li>
                 );
@@ -796,26 +915,33 @@ function App() {
         </>
       )}
 
-      {tab === 'nfb' && selected.size > 0 && (
+      {selected.size > 0 && (
         <div class='selection-bar'>
           <span>
             {selected.size} selected · <button class='link' onClick={() => setSelected(new Set())}>clear</button>
           </span>
-          <button class='primary' disabled={!canUnfollow || !allowance?.allowed} onClick={() => setSheetOpen(true)}>
-            Unfollow {selected.size}
-          </button>
+          <span class='row-actions'>
+            {actions
+              .filter(kind => selectedFor(kind).length > 0)
+              .map(kind => (
+                <button key={kind} class='primary' disabled={!canAct || !allowance?.allowed} onClick={() => setSheetKind(kind)}>
+                  {ACTION_WORDS[kind].verb} {selectedFor(kind).length}
+                </button>
+              ))}
+          </span>
         </div>
       )}
 
         </>
       )}
 
-      {sheetOpen && (
+      {sheetKind && (
         <ConfirmSheet
-          count={selected.size}
+          kind={sheetKind}
+          count={selectedFor(sheetKind).length}
           remainingToday={remainingToday}
-          onCancel={() => setSheetOpen(false)}
-          onConfirm={() => void startUnfollow(Array.from(selected))}
+          onCancel={() => setSheetKind(null)}
+          onConfirm={() => void startAction(sheetKind, selectedFor(sheetKind))}
         />
       )}
 
@@ -831,12 +957,79 @@ function App() {
   );
 }
 
+const TAB_LISTS: Record<ListTab, keyof PanelLists> = {
+  followers: 'followers',
+  following: 'following',
+  nfb: 'notFollowingBack',
+  fans: 'fans',
+  mutuals: 'mutuals',
+};
+
+function GraphView({
+  snapshots,
+  events,
+  now,
+}: {
+  snapshots: readonly SnapshotRecord[];
+  events: readonly EventRecord[];
+  now: number;
+}) {
+  const series = countSeries(snapshots);
+  if (series.length < 2) {
+    return <div class='empty'>The graph fills in as IgDiff syncs each day. Check back tomorrow.</div>;
+  }
+  const first = series[0]!;
+  const last = series.at(-1)!;
+  const day = (ms: number) => new Date(ms).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  const net = (to: number, from: number) => `${to - from >= 0 ? '+' : '−'}${Math.abs(to - from).toLocaleString()}`;
+  const month = followerDiff(events, now, 30);
+  return (
+    <div class='graph'>
+      {(['followers', 'following'] as const).map(key => {
+        const values = series.map(point => point[key]);
+        return (
+        <section key={key}>
+          <div class='graph-head'>
+            <b>{last[key].toLocaleString()}</b> {key}
+            <span class='muted'>
+              {' '}
+              {net(last[key], first[key])} since {day(first.at)}
+            </span>
+          </div>
+          <div class='chart-box'>
+            <div class='scale'>
+              <span>{Math.max(...values).toLocaleString()}</span>
+              <span>{Math.min(...values).toLocaleString()}</span>
+            </div>
+            <svg class={`chart ${key}`} viewBox='0 0 300 80' preserveAspectRatio='none' aria-label={`${key} over time`}>
+              <path d={linePath(values, 300, 80, 4)} />
+            </svg>
+          </div>
+          <div class='axis'>
+            <span>{day(first.at)}</span>
+            <span>{day(last.at)}</span>
+          </div>
+        </section>
+        );
+      })}
+      <section>
+        <div class='graph-head'>Last 30 days</div>
+        <p class='muted'>
+          <span class='plus'>+{month.gained}</span> new followers, <span class='minus'>−{month.lost}</span> unfollowed you.
+        </p>
+      </section>
+    </div>
+  );
+}
+
 function ChangesList({
   events,
   profiles,
+  avatars,
 }: {
   events: readonly EventRecord[];
   profiles: ReadonlyMap<string, ProfileRecord>;
+  avatars: ReadonlyMap<string, string>;
 }) {
   if (events.length === 0) {
     return <div class='empty'>No changes yet. They appear after your second sync.</div>;
@@ -854,7 +1047,7 @@ function ChangesList({
             const who = profile ? `@${profile.username}` : `id ${event.pk}`;
             return (
               <div key={event.id} class='row'>
-                <Avatar profile={profile} />
+                <Avatar profile={profile} picture={avatars.get(event.pk)} />
                 <div class='who'>{EVENT_TEXT[event.type](who)}</div>
                 {event.verification && (
                   <span

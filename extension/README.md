@@ -1,4 +1,4 @@
-# Follower Tracker (working name)
+# IgDiff
 
 A local-only browser extension that tracks your Instagram follow lists: who doesn't follow you back, your mutuals, your fans, and who unfollowed you over time. No exports, no extra login, no servers. Data stays in the extension's own IndexedDB.
 
