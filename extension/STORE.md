@@ -28,7 +28,7 @@ WHAT YOU GET
 • Fans: people who follow you that you don't follow back
 • Mutuals
 • Changes: who followed and unfollowed you, day by day, with unfollows double-checked with Instagram
-• Unfollow, or remove followers, one at a time or in bulk, at a slow, safe pace (at most 100 a day; it stops at the first sign Instagram objects)
+• Unfollow, remove followers or follow back, one at a time or in bulk, at a slow, safe pace (at most 100 a day; it stops at the first sign Instagram objects)
 • Keep list: star accounts you never want to unfollow or remove
 • Sort by recent, oldest or A–Z, search, and export to CSV or JSON
 • Light and dark mode
@@ -60,14 +60,14 @@ The screenshots use fictional demo accounts, not real people.
 ## Privacy practices tab
 
 **Single purpose:**
-Shows who doesn't follow you back on Instagram, your mutuals and fans, and who unfollowed you over time, and lets you unfollow or remove accounts you choose.
+Shows who doesn't follow you back on Instagram, your mutuals and fans, and who unfollowed you over time, and lets you unfollow, remove or follow back accounts you choose.
 
 **Permission justifications:**
 
 | Permission | Justification |
 |---|---|
 | Host access to `https://www.instagram.com/*` | The follow lists are read from the user's signed-in Instagram tab, with their own session. The content script runs only on www.instagram.com and renders nothing into the page. |
-| `storage` | Stores the sync schedule, today's request and action counts, and the queue of a running unfollow or removal, so they survive the background worker restarting. |
+| `storage` | Stores the sync schedule, today's request and action counts, and the queue of a running batch of unfollows, removals or follow-backs, so they survive the background worker restarting. |
 | `unlimitedStorage` | Follower history and profile pictures live in IndexedDB. Without this, Chrome may evict them under disk pressure and the user would lose their history. |
 | `alarms` | Rechecks every 30 minutes whether the daily sync is due, for Instagram tabs that stay open for days. |
 | `sidePanel` | The extension's whole interface is a side panel opened from the toolbar button. |
@@ -78,11 +78,12 @@ Shows who doesn't follow you back on Instagram, your mutuals and fans, and who u
 
 Certify all three: not sold to third parties, not used for purposes unrelated to the single purpose, not used to determine creditworthiness.
 
-**Privacy policy URL:** the public URL of `PRIVACY.md`.
+**Privacy policy URL:** https://github.com/mzhao1599/igdiff/blob/main/extension/PRIVACY.md
+
+**Homepage URL:** https://github.com/mzhao1599/igdiff · **Support URL:** https://github.com/mzhao1599/igdiff/issues
 
 ## Before submitting
 
-- [ ] Host `PRIVACY.md` at a public URL.
 - [ ] Bump `version` in `package.json` for every new upload. The store rejects a version it has already seen.
 - [ ] `npm run zip` and upload the zip.
 - [ ] Check the name. Instagram's brand guidelines have asked third-party apps not to use "IG", "Insta" or "Gram" in their names; a trademark complaint could force a rename later.
