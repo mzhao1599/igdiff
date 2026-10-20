@@ -1,0 +1,10 @@
+{
+  "extName": {
+    "message": "IgDiff: Unfollowers & Not Following Back for Instagram",
+    "description": "Extension name in the store and in Chrome. At most 75 characters. Keep \"IgDiff\" as is and end with \"for Instagram\" (or its natural equivalent)."
+  },
+  "extDescription": {
+    "message": "See who unfollowed you and who doesn't follow you back on Instagram. Free, no password, and nothing leaves your browser.",
+    "description": "Store summary and manifest description. At most 132 characters."
+  }
+}

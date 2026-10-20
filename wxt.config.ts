@@ -25,10 +25,12 @@ export default defineConfig({
     disabled: true,
   },
   manifest: ({ mode, browser }) => ({
-    // The store searches the name first, so it says what IgDiff does.
-    name: mode === 'production' ? 'IgDiff: Unfollowers & Not Following Back for Instagram' : 'IgDiff (dev)',
-    description:
-      "See who unfollowed you and who doesn't follow you back on Instagram. Free, no password, and nothing leaves your browser.",
+    // The store searches the name first, so it says what IgDiff does. Name and summary
+    // live in public/_locales/<lang>/messages.json, so each store language gets its own
+    // real translation. Dev builds keep a plain name to tell them apart in chrome://extensions.
+    name: mode === 'production' ? '__MSG_extName__' : 'IgDiff (dev)',
+    description: '__MSG_extDescription__',
+    default_locale: 'en',
     // unlimitedStorage keeps snapshot history from being evicted under disk pressure;
     // storage holds scheduler state; alarms re-checks long-lived Instagram tabs.
     permissions: ['unlimitedStorage', 'storage', 'alarms'],
