@@ -1,50 +1,36 @@
 {
-  "name": "instagram-unfollowers-pro",
-  "version": "9.0.1",
-  "description": "Safe, local tool to manage your Instagram community. Runs in your browser.",
+  "name": "igdiff",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Local-only follower tracker for Instagram: who doesn't follow back, mutuals, and who unfollowed you.",
+  "type": "module",
   "scripts": {
-    "webpack-build": "webpack --mode production",
-    "build-dev": "npm run build && webpack serve --mode development",
-    "build-prod": "npm run webpack-build && webpack serve --mode production",
-    "copy-script": "node scripts/copy-script.js dist public",
-    "generate-loader": "node scripts/generate-loader.js",
-    "build": "npm run webpack-build && npm run copy-script && npm run generate-loader",
+    "dev": "wxt",
+    "dev:firefox": "wxt -b firefox",
+    "build": "wxt build",
+    "build:dev": "wxt build --mode development",
+    "build:firefox": "wxt build -b firefox",
+    "zip": "wxt zip",
+    "typecheck": "wxt prepare && tsc --noEmit",
+    "lint": "eslint .",
     "test": "vitest run",
-    "test:watch": "vitest"
-  },
-  "babel": {
-    "plugins": [
-      "@babel/plugin-transform-react-jsx"
-    ]
-  },
-  "devDependencies": {
-    "@babel/cli": "^7.26.4",
-    "@babel/core": "^7.26.0",
-    "@babel/plugin-transform-react-jsx": "^7.25.9",
-    "@types/chrome": "^0.1.38",
-    "@typescript-eslint/eslint-plugin": "^5.62.0",
-    "@typescript-eslint/parser": "^5.62.0",
-    "css-loader": "^6.11.0",
-    "dotenv-webpack": "^9.0.0",
-    "eslint": "^8.57.1",
-    "eslint-plugin-react": "^7.37.4",
-    "eslint-plugin-react-hooks": "^4.6.2",
-    "sass": "^1.83.4",
-    "sass-loader": "^13.3.3",
-    "style-loader": "^3.3.4",
-    "to-string-loader": "^1.2.0",
-    "ts-loader": "^9.5.2",
-    "typescript": "^5.7.3",
-    "webpack": "^5.97.1",
-    "webpack-bundle-analyzer": "^5.3.0",
-    "webpack-cli": "^5.1.4",
-    "webpack-dev-server": "^5.2.0",
-    "vitest": "^3.2.4"
+    "test:watch": "vitest",
+    "prepare-types": "wxt prepare"
   },
   "dependencies": {
-    "chart.js": "^4.5.1",
-    "jspdf": "^4.2.1",
-    "jspdf-autotable": "^5.0.7",
-    "preact": "^10.25.4"
+    "idb": "8.0.3",
+    "preact": "10.29.8"
+  },
+  "devDependencies": {
+    "@babel/core": "7.29.7",
+    "@eslint/js": "9.39.5",
+    "@preact/preset-vite": "2.10.6",
+    "eslint": "9.39.5",
+    "fake-indexeddb": "6.2.5",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.71.0",
+    "vite": "7.3.6",
+    "vitest": "4.1.11",
+    "wxt": "0.21.4"
   }
 }

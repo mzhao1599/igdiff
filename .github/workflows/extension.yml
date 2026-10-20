@@ -2,13 +2,7 @@ name: Extension
 
 on:
   push:
-    paths:
-      - 'extension/**'
-      - '.github/workflows/extension.yml'
   pull_request:
-    paths:
-      - 'extension/**'
-      - '.github/workflows/extension.yml'
   workflow_dispatch:
 
 permissions:
@@ -21,9 +15,6 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: extension
     steps:
       - uses: actions/checkout@v5
 
@@ -31,7 +22,6 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: extension/package-lock.json
 
       - run: npm ci
       - run: npm run typecheck
@@ -56,7 +46,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: igdiff-chrome
-          path: extension/.output/*-chrome.zip
+          path: .output/*-chrome.zip
           if-no-files-found: error
           # WXT writes to .output/, which the action skips by default as hidden.
           include-hidden-files: true

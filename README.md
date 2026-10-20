@@ -4,7 +4,7 @@
 
 [**Add to Chrome →**](https://chromewebstore.google.com/detail/igdiff/nmkbnileakkkaplacmlcmponmpnaihdb)
 
-![IgDiff showing who doesn't follow you back](extension/store-assets/1-dont-follow-back.png)
+![IgDiff showing who doesn't follow you back](store-assets/1-dont-follow-back.png)
 
 ## How it works
 
@@ -25,7 +25,7 @@ There's no login, no data export, and no scan button.
 
 - Your data stays in your browser (IndexedDB). There are no servers, analytics or ads.
 - IgDiff talks only to Instagram, from your own signed-in tab, using the session you already have. It never sees your password.
-- You can delete everything with one click. [Privacy policy](extension/PRIVACY.md)
+- You can delete everything with one click. [Privacy policy](PRIVACY.md)
 
 ## Safe pacing
 
@@ -33,12 +33,12 @@ Unfollows, removals and follow-backs go 15–35 seconds apart, with a 5-minute b
 
 ## Develop
 
-The extension lives in [`extension/`](extension/). It's built with WXT, Preact and TypeScript, and tested with Vitest against a fake Instagram. See [extension/README.md](extension/README.md) for building, loading and testing.
+It's built with WXT, Preact and TypeScript, and tested with Vitest against a fake Instagram. See [CONTRIBUTING.md](CONTRIBUTING.md) for building, loading and testing.
 
 ## Credits and license
 
-IgDiff is a rewrite built on [InstagramUnfollowers](https://github.com/davidarroyo1234/InstagramUnfollowers) by David Arroyo and [Edvin's fork](https://github.com/EdvinCodes/InstagramUnfollowers). Their original web app is still in this repository; see [README.legacy.md](README.legacy.md).
+IgDiff is a rewrite built on [InstagramUnfollowers](https://github.com/davidarroyo1234/InstagramUnfollowers) by David Arroyo and [Edvin's fork](https://github.com/EdvinCodes/InstagramUnfollowers). Their web app is in this repository's history before IgDiff.
 
-MIT licensed. See [extension/LICENSE](extension/LICENSE).
+MIT licensed. See [LICENSE](LICENSE).
 
 IgDiff is not affiliated with, endorsed by, or sponsored by Instagram or Meta.
