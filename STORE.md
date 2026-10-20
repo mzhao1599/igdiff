@@ -8,36 +8,55 @@ Everything to paste into the developer dashboard. Keep it in sync with `wxt.conf
 
 ## Store listing tab
 
-**Name:** IgDiff (from the manifest)
+**Name** (from the manifest, 54 of 75 characters; the store searches it first):
+IgDiff: Unfollowers & Not Following Back for Instagram
 
-**Summary** (from the manifest, 124 of 132 characters):
-See who doesn't follow you back, who unfollowed you, and your mutuals on Instagram. Automatic, private, all in your browser.
+**Summary** (from the manifest, 120 of 132 characters):
+See who unfollowed you and who doesn't follow you back on Instagram. Free, no password, and nothing leaves your browser.
 
 **Category:** Social Networking. **Language:** English.
 
-**Description:**
+**Description** (say "Instagram" at most five times: the store treats more as keyword spam):
 
 ```
-IgDiff shows you, automatically, who doesn't follow you back on Instagram, who unfollowed you, your mutuals and your fans.
+See who unfollowed you on Instagram and who doesn't follow you back, automatically. IgDiff is free and open source. It never asks for your password, and your data never leaves your browser.
 
-Open Instagram in a tab where you're already signed in. IgDiff reads your follower and following lists in the background (about 20 seconds for 1,000 accounts), then keeps a daily snapshot, so you can see exactly who came and went.
+Stay signed in as usual. IgDiff reads your followers and following in the background from your open tab (about 20 seconds for 1,000 accounts) and keeps a daily snapshot, so you can see exactly who came and went.
 
 WHAT YOU GET
-• Followers and following, with a 7-day diff and a trend graph
-• Don't follow back: everyone you follow who doesn't follow you
+• Unfollowers: who unfollowed you, day by day. Each one is double-checked before it shows up.
+• Not following back: everyone you follow who doesn't follow you back
 • Fans: people who follow you that you don't follow back
 • Mutuals
-• Changes: who followed and unfollowed you, day by day, with unfollows double-checked with Instagram
-• Unfollow, remove followers or follow back, one at a time or in bulk, at a slow, safe pace (at most 100 a day; it stops at the first sign Instagram objects)
+• Follower and following counts, with a 7-day change and a follower graph
+• Unfollow, remove followers or follow back, one at a time or in bulk, at a slow, safe pace (at most 100 a day; it stops at the first sign of trouble)
 • Keep list: star accounts you never want to unfollow or remove
+• A toolbar badge when someone unfollows you
 • Sort by recent, oldest or A–Z, search, and export to CSV or JSON
 • Light and dark mode
 
 PRIVATE BY DESIGN
-• No login: it uses the Instagram session you already have
-• No servers: your data stays in your browser, and nothing is sent anywhere but Instagram
+• No login: it uses the session you already have in your browser
+• No servers: everything is stored on your computer, and nothing is sent anywhere else
 • No tracking, no ads, no analytics
 • Delete everything with one click
+• Open source: anyone can read the code on GitHub
+
+QUESTIONS
+How do I see who unfollowed me?
+Install IgDiff and open your account in a signed-in tab. The first sync shows who doesn't follow you back right away. After that, IgDiff compares each day's snapshot with the last and lists anyone who unfollowed you.
+
+Does it need my password?
+No. It works inside your own signed-in tab and never sees your password.
+
+Will my account get blocked?
+IgDiff reads your lists once a day. Unfollows and removals go one at a time, 15 to 35 seconds apart, at most 100 a day, and stop the moment anything looks wrong.
+
+Does it work on my phone?
+No. It's a Chrome extension, so it runs on a computer.
+
+Is it free?
+Yes. There's no premium tier and no account to create.
 
 HOW TO USE
 1. Install IgDiff and pin it to the toolbar.

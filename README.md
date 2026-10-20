@@ -31,6 +31,23 @@ There's no login, no data export, and no scan button.
 
 Unfollows, removals and follow-backs go 15–35 seconds apart, with a 5-minute break every 10 and at most 100 a day. IgDiff stops at the first sign that Instagram objects and waits a day. Nothing ever happens without your confirmation.
 
+## FAQ
+
+**How do I see who unfollowed me on Instagram?**
+Install IgDiff and stay signed in to Instagram in Chrome. The first sync shows who doesn't follow you back right away. After that, IgDiff compares each day's snapshot with the last and lists anyone who unfollowed you, with a toolbar badge when it happens.
+
+**Does it need my Instagram password?**
+No. It runs inside your own signed-in tab and never sees your password.
+
+**Can Instagram block my account for using it?**
+IgDiff reads your lists once a day. Unfollows and removals are paced and capped as described above, and IgDiff stops at the first sign that Instagram objects.
+
+**Does it work on my phone?**
+No. It's a Chrome extension, so it runs on a computer.
+
+**Is it free?**
+Yes, and open source under the MIT license. There's no premium tier and no account to create.
+
 ## Develop
 
 It's built with WXT, Preact and TypeScript, and tested with Vitest against a fake Instagram. See [CONTRIBUTING.md](CONTRIBUTING.md) for building, loading and testing.

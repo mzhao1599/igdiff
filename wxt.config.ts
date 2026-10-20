@@ -25,9 +25,10 @@ export default defineConfig({
     disabled: true,
   },
   manifest: ({ mode, browser }) => ({
-    name: mode === 'production' ? 'IgDiff' : 'IgDiff (dev)',
+    // The store searches the name first, so it says what IgDiff does.
+    name: mode === 'production' ? 'IgDiff: Unfollowers & Not Following Back for Instagram' : 'IgDiff (dev)',
     description:
-      "See who doesn't follow you back, who unfollowed you, and your mutuals on Instagram. Automatic, private, all in your browser.",
+      "See who unfollowed you and who doesn't follow you back on Instagram. Free, no password, and nothing leaves your browser.",
     // unlimitedStorage keeps snapshot history from being evicted under disk pressure;
     // storage holds scheduler state; alarms re-checks long-lived Instagram tabs.
     permissions: ['unlimitedStorage', 'storage', 'alarms'],
